@@ -1,5 +1,7 @@
 import pygame
 import random
+from CTL_bridge import UserPredictor, build_horizon_tree
+from tree_viewer import TreeViewer
 from pyFighters import Action, LogicFightersState
 from animator import build_animator
 from ui_elements import draw_button, draw_character_hud
@@ -72,6 +74,12 @@ class GameGUI:
         self.arrow_manager = ArrowManager()
         self.bt_ai = BehaviorTreeAI()
         self.bg_manager = BackgroundManager("Backgrounds", (self.width, self.height))
+
+        # Modello utente e ispezione albero
+        self.user_predictor = UserPredictor()
+        self.tree_viewer = TreeViewer()
+        self.horizon_tree = None
+        self.show_tree_overlay = False
         self.update_ui_layout()
 
     def update_ui_layout(self):
@@ -137,6 +145,8 @@ class GameGUI:
         self.player_action = Action.ATTACK
         self.is_paused = False
         self.arrow_manager.arrows.clear()
+
+        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=3)
         
         self.player_animator = build_animator(self.selected_player_class, scale=3.0, facing_right=True)
         self.npc_animator = build_animator(self.selected_npc_class, scale=3.0, facing_right=False)
@@ -166,6 +176,9 @@ class GameGUI:
         return (spawn_x, spawn_y)
 
     def resolve_turn(self):
+        # 1. Registra l'azione reale dell'utente per aggiornare P(a_P | s)
+        self.user_predictor.record_action(self.state.player, self.player_action)
+
         if self.selected_ai == "Behavior Tree":
             self.state.npc.char_class = self.selected_npc_class
             npc_action = self.bt_ai.decide_action(self.state, npc_role="npc")
@@ -173,6 +186,9 @@ class GameGUI:
             npc_action = Action.DEFEND
             
         self.last_result = self.state.apply_action_resolution(self.player_action, npc_action)
+
+        # 2. Ricostruisce l'albero di transizione per il monitoraggio a orizzonte finito
+        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=3)
         
         p_state = ANIM_STATE_MAP.get(self.player_action, "idle")
         n_state = ANIM_STATE_MAP.get(npc_action, "idle")
@@ -490,6 +506,18 @@ class GameGUI:
             draw_button(self.screen, self.font_sub, self.pause_buttons["quit_battle"], "Quit Battle", fill=(180, 120, 40))
             draw_button(self.screen, self.font_sub, self.pause_buttons["quit_game"], "Quit Game", fill=(180, 40, 40))
 
+        # Disegna il pulsante di ispezione nell'angolo inferiore
+        inspect_btn = pygame.Rect(self.width - 200, self.height - 50, 180, 36)
+        draw_button(self.screen, self.font_small, inspect_btn, "Inspect Tree [T]", fill=(45, 60, 85))
+
+        # Se attivo, disegna l'albero in sovraimpressione
+        if self.show_tree_overlay and self.horizon_tree:
+            self.tree_viewer.draw(
+                self.screen, self.horizon_tree,
+                self.font_sub, self.font_small,
+                self.width, self.height
+            )
+
         pygame.display.flip()
 
     def handle_battle_events(self, event):
@@ -511,6 +539,16 @@ class GameGUI:
 
         if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE and not self.state.is_finished():
             self.resolve_turn()
+
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
+            self.show_tree_overlay = not self.show_tree_overlay
+            return
+
+        if self.show_tree_overlay:
+            self.tree_viewer.handle_event(event)
+            if event.type == pygame.KEYDOWN and event.key in [pygame.K_t, pygame.K_ESCAPE]:
+                self.show_tree_overlay = False
+            return        
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.state.is_finished() and getattr(self, 'victory_button', self.pause_buttons["resume"]).collidepoint(event.pos):

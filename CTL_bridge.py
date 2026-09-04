@@ -1,0 +1,111 @@
+import copy
+from pyFighters import Action, LogicFightersState
+
+class UserPredictor:
+    def __init__(self):
+        self.actions = [Action.ATTACK, Action.DEFEND, Action.COUNTER, Action.BUFF]
+        # Tabelle di frequenza condizionate dallo stato
+        # Contesti: 'neutral', 'special_ready', 'critical_hp'
+        self.counts = {
+            "neutral": {a: 1.0 for a in self.actions},
+            "special_ready": {Action.ATTACK: 4.0, Action.SPECIAL: 6.0, Action.DEFEND: 1.0, Action.COUNTER: 1.0, Action.BUFF: 1.0},
+            "critical_hp": {Action.ATTACK: 1.0, Action.DEFEND: 4.0, Action.COUNTER: 3.0, Action.BUFF: 1.0}
+        }
+
+    def _get_context(self, player):
+        if player.sp >= player.stats["sp_threshold"]:
+            return "special_ready"
+        if player.hp <= int(player.stats["max_hp"] * 0.35):
+            return "critical_hp"
+        return "neutral"
+
+    def record_action(self, player_before, chosen_action):
+        ctx = self._get_context(player_before)
+        if chosen_action not in self.counts[ctx]:
+            self.counts[ctx][chosen_action] = 0.0
+        self.counts[ctx][chosen_action] += 1.0
+
+    def get_distribution(self, player):
+        ctx = self._get_context(player)
+        table = self.counts[ctx]
+        
+        # Filtra azioni disponibili
+        avail = [Action.DEFEND, Action.COUNTER, Action.BUFF]
+        if player.sp >= player.stats["sp_threshold"]:
+            avail.append(Action.SPECIAL)
+        else:
+            avail.append(Action.ATTACK)
+
+        total = sum(table.get(a, 1.0) for a in avail)
+        return {a: table.get(a, 1.0) / total for a in avail}
+
+
+class StateTreeNode:
+    def __init__(self, state_snapshot, depth=0, parent_prob=1.0):
+        self.state = state_snapshot
+        self.depth = depth
+        self.prob = parent_prob
+        # transizioni: lista di tuple (a_P, a_N, prob_transizione, child_node)
+        self.transitions = []
+        self.atomic_props = self._evaluate_atomic_props()
+
+    def _evaluate_atomic_props(self):
+        p, n = self.state.player, self.state.npc
+        props = set()
+        if p.hp <= 0: props.add("Dead_P")
+        if n.hp <= 0: props.add("Dead_N")
+        if p.sp >= p.stats["sp_threshold"]: props.add("Special_P")
+        if n.sp >= n.stats["sp_threshold"]: props.add("Special_N")
+        if p.hp <= int(p.stats["max_hp"] * 0.3): props.add("LowHP_P")
+        if n.hp <= int(n.stats["max_hp"] * 0.3): props.add("LowHP_N")
+        return props
+
+
+def clone_state(base_state):
+    """Copia profonda dello stato per la simulazione a passi in avanti."""
+    new_s = LogicFightersState(base_state.player.char_class, base_state.npc.char_class)
+    new_s.turn = base_state.turn
+    new_s.player = copy.deepcopy(base_state.player)
+    new_s.npc = copy.deepcopy(base_state.npc)
+    return new_s
+
+
+def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, current_prob=1.0, prune_threshold=0.08):
+    node = StateTreeNode(current_state, depth=cur_depth, parent_prob=current_prob)
+    
+    if cur_depth >= max_depth or current_state.is_finished():
+        return node
+
+    # Distribuzione delle mosse dell'utente stimata dinamicamente
+    p_dist = user_predictor.get_distribution(current_state.player)
+    
+    # Azioni NPC
+    npc_actions = [Action.DEFEND, Action.COUNTER, Action.BUFF]
+    if current_state.npc.sp >= current_state.npc.stats["sp_threshold"]:
+        npc_actions.append(Action.SPECIAL)
+    else:
+        npc_actions.append(Action.ATTACK)
+
+    num_npc_actions = len(npc_actions)
+    for a_p, prob_p in p_dist.items():
+        if prob_p < prune_threshold:
+            continue
+            
+        for a_n in npc_actions:
+            next_s = clone_state(current_state)
+            next_s.apply_action_resolution(a_p, a_n)
+            
+            # Se consideriamo le azioni dell'NPC non ancora decise (equiprobabili nello spazio di esplorazione):
+            joint_prob = prob_p / num_npc_actions
+            branch_prob = current_prob * joint_prob
+            
+            child_node = build_horizon_tree(
+                next_s, user_predictor,
+                max_depth=max_depth,
+                cur_depth=cur_depth + 1,
+                current_prob=branch_prob,
+                prune_threshold=prune_threshold
+            )
+            node.transitions.append((a_p, a_n, joint_prob, child_node))
+
+    return node
