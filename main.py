@@ -146,7 +146,7 @@ class GameGUI:
         self.is_paused = False
         self.arrow_manager.arrows.clear()
 
-        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=1)
+        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=2)
         
         self.player_animator = build_animator(self.selected_player_class, scale=3.0, facing_right=True)
         self.npc_animator = build_animator(self.selected_npc_class, scale=3.0, facing_right=False)

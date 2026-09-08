@@ -52,12 +52,35 @@ class StateTreeNode:
     def _evaluate_atomic_props(self):
         p, n = self.state.player, self.state.npc
         props = set()
+        
+        # --- Sopravvivenza ---
         if p.hp <= 0: props.add("Dead_P")
         if n.hp <= 0: props.add("Dead_N")
-        if p.sp >= p.stats["sp_threshold"]: props.add("Special_P")
-        if n.sp >= n.stats["sp_threshold"]: props.add("Special_N")
         if p.hp <= int(p.stats["max_hp"] * 0.3): props.add("LowHP_P")
         if n.hp <= int(n.stats["max_hp"] * 0.3): props.add("LowHP_N")
+        
+        # --- Vantaggio ---
+        if n.hp > p.hp: props.add("HP_Advantage_N")
+        
+        # --- Speciali e Minacce ---
+        # Player
+        if p.sp >= p.stats["sp_threshold"]: props.add("SpecialReady_P")
+        elif p.sp >= p.stats["sp_threshold"] - 2: props.add("SpecialDanger_P")
+        # NPC
+        if n.sp >= n.stats["sp_threshold"]: props.add("SpecialReady_N")
+        elif n.sp >= n.stats["sp_threshold"] - 2: props.add("SpecialDanger_N")
+        
+        # --- Stato dei Buff ---
+        if p.def_buff_turns > 0: props.add("DefBuff_P")
+        if p.atk_buff_turns > 0: props.add("AtkBuff_P")
+        if n.def_buff_turns > 0: props.add("DefBuff_N")
+        if n.atk_buff_turns > 0: props.add("AtkBuff_N")
+        
+        # --- Cooldowns ---
+        # Uso getattr per evitare crash nel caso in cui counter_cooldown non fosse stato inizializzato
+        if getattr(p, "counter_cooldown", 0) == 0: props.add("CounterReady_P")
+        if getattr(n, "counter_cooldown", 0) == 0: props.add("CounterReady_N")
+        
         return props
 
 
