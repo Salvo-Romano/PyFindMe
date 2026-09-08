@@ -84,6 +84,24 @@ class CheckNeedsSP(BTNode):
             return NodeStatus.SUCCESS, None
         return NodeStatus.FAILURE, None
 
+class CheckCounterAvailable(BTNode):
+    def tick(self, state, npc_role="npc"):
+        npc = state.npc if npc_role == "npc" else state.player
+        # Usa getattr per sicurezza, nel caso la variabile non sia ancora inizializzata a monte
+        if getattr(npc, "counter_cooldown", 0) == 0:
+            return NodeStatus.SUCCESS, None
+        return NodeStatus.FAILURE, None
+
+class CheckBuffActive(BTNode):
+    def tick(self, state, npc_role="npc"):
+        npc = state.npc if npc_role == "npc" else state.player
+        # Fallisce se il buff specifico della classe è già attivo
+        if npc.char_class == "Warrior" and getattr(npc, "def_buff_turns", 0) > 0:
+            return NodeStatus.FAILURE, None
+        if npc.char_class == "Ranger" and getattr(npc, "atk_buff_turns", 0) > 0:
+            return NodeStatus.FAILURE, None
+        return NodeStatus.SUCCESS, None
+
 class ActionLeaf(BTNode):
     def __init__(self, action):
         self.action = action
@@ -96,62 +114,58 @@ class ActionLeaf(BTNode):
 
 def build_warrior_tree():
     return Selector([
-        # 1. Scarica la Special se pronta
         Sequence([
             CheckSpecialReady(),
             ActionLeaf(Action.SPECIAL)
         ]),
-        # 2. Reazione difensiva se l'avversario sta per sparare la Special
         Sequence([
             CheckOpponentThreat(),
             ActionLeaf(Action.DEFEND)
         ]),
-        # 3. Contrattacco tattico se ha accumulato almeno 1 SP
         Sequence([
             CheckSPThreshold(1, mode="at_least"),
             CheckHealthRatio(0.40, mode="above"),
+            CheckCounterAvailable(),
             ActionLeaf(Action.COUNTER)
         ]),
-        # 4. Difesa disperata se sta morendo
         Sequence([
             CheckHealthRatio(0.25, mode="below"),
             ActionLeaf(Action.DEFEND)
         ]),
-        # 5. Buff tattico iniziale per non essere mono-attacco
         Sequence([
             CheckSPThreshold(0, mode="at_least"),
             CheckSPThreshold(2, mode="less_than"),
             CheckHealthRatio(0.70, mode="above"),
+            CheckBuffActive(),
             ActionLeaf(Action.BUFF)
         ]),
-        # Fallback principale
         ActionLeaf(Action.ATTACK)
     ])
 
 def build_mage_tree():
     return Selector([
-        # 1. Scatena la Special
         Sequence([
             CheckSpecialReady(),
             ActionLeaf(Action.SPECIAL)
         ]),
-        # 2. Difesa assoluta se minacciato da Special nemica
         Sequence([
             CheckOpponentThreat(),
             ActionLeaf(Action.DEFEND)
         ]),
-        # 3. Difesa d'emergenza a HP bassi
         Sequence([
             CheckHealthRatio(0.35, mode="below"),
             ActionLeaf(Action.DEFEND)
         ]),
-        # 4. Buff condizionato: SOLO se ha vita e gli mancano parecchi SP
+        Sequence([
+            CheckSPThreshold(2, mode="at_least"),
+            CheckCounterAvailable(),
+            ActionLeaf(Action.COUNTER)
+        ]),
         Sequence([
             CheckHealthRatio(0.45, mode="above"),
             CheckNeedsSP(),
             ActionLeaf(Action.BUFF)
         ]),
-        # 5. Altrimenti attacca per infliggere danni costanti
         ActionLeaf(Action.ATTACK)
     ])
 
@@ -167,11 +181,13 @@ def build_ranger_tree():
         ]),
         Sequence([
             CheckSPThreshold(2, mode="at_least"),
+            CheckCounterAvailable(),
             ActionLeaf(Action.COUNTER)
         ]),
         Sequence([
             CheckHealthRatio(0.50, mode="above"),
             CheckNeedsSP(),
+            CheckBuffActive(),
             ActionLeaf(Action.BUFF)
         ]),
         ActionLeaf(Action.ATTACK)

@@ -109,3 +109,70 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
             node.transitions.append((a_p, a_n, joint_prob, child_node))
 
     return node
+
+
+def generate_vitamin_model(root_node):
+    # 1. Raccogli tutti i nodi unici nell'albero (Visita in profondità/DFS)
+    nodes = []
+    def collect_nodes(node):
+        if node not in nodes:
+            nodes.append(node)
+            for _, _, _, child in node.transitions:
+                collect_nodes(child)
+                
+    collect_nodes(root_node)
+    
+    # 2. Assegna nomi agli stati e raccogli tutte le Proposizioni Atomiche (AP)
+    state_names = [f"s{i}" for i in range(len(nodes))]
+    all_aps = set()
+    for n in nodes:
+        all_aps.update(n.atomic_props)
+    all_aps = sorted(list(all_aps))
+    
+    # Fallback di sicurezza: VITAMIN fallisce se non c'è almeno una AP
+    if not all_aps:
+        all_aps = ["neutral"]
+        for n in nodes:
+            n.atomic_props.add("neutral")
+
+    # 3. Costruisci la Matrice di Transizione (|S| x |S|)
+    matrix = [["0" for _ in nodes] for _ in nodes]
+    for i, node in enumerate(nodes):
+        if not node.transitions:
+            # I model checker CTL richiedono transizioni totali (nessun vicolo cieco)
+            # Aggiungiamo un auto-anello (self-loop) sugli stati foglia
+            matrix[i][i] = "loop"
+        else:
+            for ap_action, npc_action, _, child in node.transitions:
+                j = nodes.index(child)
+                # Inseriamo un'etichetta per l'azione (es. Atk_Def) per debug visivo
+                action_label = f"{ap_action.name[:3]}_{npc_action.name[:3]}"
+                matrix[i][j] = action_label
+
+    # 4. Genera il file di testo seguendo rigorosamente la sintassi
+    lines = []
+    
+    lines.append("Transition")
+    for row in matrix:
+        lines.append(" ".join(row))
+        
+    lines.append("Name_State")
+    lines.append(" ".join(state_names))
+    
+    lines.append("Initial_State")
+    lines.append(state_names[0])
+    
+    lines.append("Atomic_propositions")
+    lines.append(" ".join(all_aps))
+    
+    lines.append("Labelling")
+    for node in nodes:
+        row = []
+        for ap in all_aps:
+            row.append("1" if ap in node.atomic_props else "0")
+        lines.append(" ".join(row))
+        
+    lines.append("Number_of_agents")
+    lines.append("1")
+    
+    return "\n".join(lines)

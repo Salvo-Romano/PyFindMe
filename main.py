@@ -1,6 +1,6 @@
 import pygame
 import random
-from CTL_bridge import UserPredictor, build_horizon_tree
+from CTL_bridge import UserPredictor, build_horizon_tree, generate_vitamin_model
 from tree_viewer import TreeViewer
 from pyFighters import Action, LogicFightersState
 from animator import build_animator
@@ -146,7 +146,7 @@ class GameGUI:
         self.is_paused = False
         self.arrow_manager.arrows.clear()
 
-        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=3)
+        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=1)
         
         self.player_animator = build_animator(self.selected_player_class, scale=3.0, facing_right=True)
         self.npc_animator = build_animator(self.selected_npc_class, scale=3.0, facing_right=False)
@@ -543,6 +543,13 @@ class GameGUI:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
             self.show_tree_overlay = not self.show_tree_overlay
             return
+
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_e:
+            if self.horizon_tree:
+                model_text = generate_vitamin_model(self.horizon_tree)
+                with open("model.txt", "w") as f:
+                    f.write(model_text)
+                print("Modello esportato in model.txt!")        
 
         if self.show_tree_overlay:
             self.tree_viewer.handle_event(event)
