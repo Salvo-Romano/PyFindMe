@@ -49,15 +49,17 @@ class StateTreeNode:
         self.transitions = []
         self.atomic_props = self._evaluate_atomic_props()
 
-    def _evaluate_atomic_props(self):
+    '''def _evaluate_atomic_props(self):
         p, n = self.state.player, self.state.npc
         props = set()
         
         # --- Sopravvivenza ---
         if p.hp <= 0: props.add("Dead_P")
         if n.hp <= 0: props.add("Dead_N")
+        if n.hp > 0: props.add("Alive_N") 
         if p.hp <= int(p.stats["max_hp"] * 0.3): props.add("LowHP_P")
         if n.hp <= int(n.stats["max_hp"] * 0.3): props.add("LowHP_N")
+        
         
         # --- Vantaggio ---
         if n.hp > p.hp: props.add("HP_Advantage_N")
@@ -81,6 +83,16 @@ class StateTreeNode:
         if getattr(p, "counter_cooldown", 0) == 0: props.add("CounterReady_P")
         if getattr(n, "counter_cooldown", 0) == 0: props.add("CounterReady_N")
         
+        return props'''
+        
+    def _evaluate_atomic_props(self):
+        p, n = self.state.player, self.state.npc
+        props = set()
+        
+        # Modello dummy minimale per testare la pipeline
+        if n.hp > 0: 
+            props.add("Alive_N")
+            
         return props
 
 
@@ -92,17 +104,58 @@ def clone_state(base_state):
     new_s.npc = copy.deepcopy(base_state.npc)
     return new_s
 
+def get_state_signature(state, current_depth):
+    p = state.player
+    n = state.npc
+    
+    # La tupla rappresenta l'impronta digitale univoca dello stato
+    return (
+        current_depth,
+        p.hp, p.sp, getattr(p, "atk_buff_turns", 0), getattr(p, "def_buff_turns", 0), getattr(p, "counter_cooldown", 0),
+        n.hp, n.sp, getattr(n, "atk_buff_turns", 0), getattr(n, "def_buff_turns", 0), getattr(n, "counter_cooldown", 0)
+    )
+    
+def get_action_code(action):
+    # Mappa l'enum Action al singolo carattere
+    mapping = {
+        Action.ATTACK: "A",
+        Action.DEFEND: "D",
+        Action.COUNTER: "C",
+        Action.BUFF: "B",
+        Action.SPECIAL: "S"
+    }
+    return mapping.get(action, "U")
 
-def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, current_prob=1.0, prune_threshold=0.08):
+def format_joint_action(action_p1, action_p2):
+    # Unisce i codici. Esempio: ATTACK e DEFEND diventano "AD"
+    code_p1 = get_action_code(action_p1)
+    code_p2 = get_action_code(action_p2)
+    return f"{code_p1}{code_p2}"
+
+def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, current_prob=1.0, prune_threshold=0.08, memo=None, use_dag=True):
+    # Inizializziamo il dizionario solo se stiamo usando il DAG e siamo alla radice
+    if use_dag and memo is None:
+        memo = {}
+        
+    # 1. Se usiamo il DAG, calcoliamo la firma e cerchiamo nel dizionario
+    if use_dag:
+        signature = get_state_signature(current_state, cur_depth)
+        if signature in memo:
+            return memo[signature]
+            
+    # 2. Creazione del nuovo nodo (sia per Tree che per DAG)
     node = StateTreeNode(current_state, depth=cur_depth, parent_prob=current_prob)
     
+    # 3. Se usiamo il DAG, salviamo il nodo appena creato per i futuri rami
+    if use_dag:
+        memo[signature] = node
+    
+    # Condizione di uscita dalla ricorsione
     if cur_depth >= max_depth or current_state.is_finished():
         return node
 
-    # Distribuzione delle mosse dell'utente stimata dinamicamente
     p_dist = user_predictor.get_distribution(current_state.player)
     
-    # Azioni NPC
     npc_actions = [Action.DEFEND, Action.COUNTER, Action.BUFF]
     if current_state.npc.sp >= current_state.npc.stats["sp_threshold"]:
         npc_actions.append(Action.SPECIAL)
@@ -110,6 +163,7 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
         npc_actions.append(Action.ATTACK)
 
     num_npc_actions = len(npc_actions)
+    
     for a_p, prob_p in p_dist.items():
         if prob_p < prune_threshold:
             continue
@@ -118,16 +172,18 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
             next_s = clone_state(current_state)
             next_s.apply_action_resolution(a_p, a_n)
             
-            # Se consideriamo le azioni dell'NPC non ancora decise (equiprobabili nello spazio di esplorazione):
             joint_prob = prob_p / num_npc_actions
             branch_prob = current_prob * joint_prob
             
+            # Passiamo il flag use_dag e il dizionario memo ai figli
             child_node = build_horizon_tree(
                 next_s, user_predictor,
                 max_depth=max_depth,
                 cur_depth=cur_depth + 1,
                 current_prob=branch_prob,
-                prune_threshold=prune_threshold
+                prune_threshold=prune_threshold,
+                memo=memo,
+                use_dag=use_dag # <--- Propagazione del flag
             )
             node.transitions.append((a_p, a_n, joint_prob, child_node))
 
@@ -169,7 +225,7 @@ def generate_vitamin_model(root_node):
             for ap_action, npc_action, _, child in node.transitions:
                 j = nodes.index(child)
                 # Inseriamo un'etichetta per l'azione (es. Atk_Def) per debug visivo
-                action_label = f"{ap_action.name[:3]}_{npc_action.name[:3]}"
+                action_label = format_joint_action(ap_action, npc_action)
                 matrix[i][j] = action_label
 
     # 4. Genera il file di testo seguendo rigorosamente la sintassi
@@ -199,3 +255,42 @@ def generate_vitamin_model(root_node):
     lines.append("1")
     
     return "\n".join(lines)
+
+def parse_vitamin_trace(response_json, root_node):
+    # Prendiamo direttamente tutti i nodi considerati validi dal solver
+    verification = response_json.get("verification", {})
+    trace_states = verification.get("satisfying_states", [])
+    
+    if not trace_states:
+        return Action.DEFEND, set()
+
+    nodes = []
+    def collect_nodes(node):
+        if node not in nodes:
+            nodes.append(node)
+            for _, _, _, child in node.transitions:
+                collect_nodes(child)
+                
+    collect_nodes(root_node)
+
+    safe_nodes = set()
+    for state_name in trace_states:
+        try:
+            idx = int(state_name.replace("s", ""))
+            safe_nodes.add(nodes[idx])
+        except (ValueError, IndexError):
+            continue
+
+    action_scores = {}
+    for p_act, n_act, prob, child in root_node.transitions:
+        if n_act not in action_scores:
+            action_scores[n_act] = 0.0
+        
+        if child in safe_nodes:
+            action_scores[n_act] += prob
+
+    if not action_scores:
+        return Action.DEFEND, set()
+        
+    best_action = max(action_scores.items(), key=lambda x: x[1])[0]
+    return best_action, safe_nodes

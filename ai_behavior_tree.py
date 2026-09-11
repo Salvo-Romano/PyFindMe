@@ -1,4 +1,5 @@
 from pyFighters import Action
+import random
 
 class NodeStatus:
     SUCCESS = "SUCCESS"
@@ -111,7 +112,6 @@ class ActionLeaf(BTNode):
 
 
 # --- Costruttori Alberi Ribilanciati ---
-
 def build_warrior_tree():
     return Selector([
         Sequence([
@@ -122,8 +122,10 @@ def build_warrior_tree():
             CheckOpponentThreat(),
             ActionLeaf(Action.DEFEND)
         ]),
+        # Il Guerriero aspetta di avere almeno 2 SP per fare Counter,
+        # per evitare di sprecare il cooldown se non è in vero pericolo
         Sequence([
-            CheckSPThreshold(1, mode="at_least"),
+            CheckSPThreshold(2, mode="at_least"),
             CheckHealthRatio(0.40, mode="above"),
             CheckCounterAvailable(),
             ActionLeaf(Action.COUNTER)
@@ -132,10 +134,9 @@ def build_warrior_tree():
             CheckHealthRatio(0.25, mode="below"),
             ActionLeaf(Action.DEFEND)
         ]),
+        # Buff difensivo: ora mitiga 2, ma dura 2 turni.
         Sequence([
-            CheckSPThreshold(0, mode="at_least"),
-            CheckSPThreshold(2, mode="less_than"),
-            CheckHealthRatio(0.70, mode="above"),
+            CheckHealthRatio(0.60, mode="above"),
             CheckBuffActive(),
             ActionLeaf(Action.BUFF)
         ]),
@@ -156,13 +157,17 @@ def build_mage_tree():
             CheckHealthRatio(0.35, mode="below"),
             ActionLeaf(Action.DEFEND)
         ]),
+        # Con una Special che si carica in soli 2 turni di buff, 
+        # il Mago usa il counter solo per difendersi strategicamente
         Sequence([
             CheckSPThreshold(2, mode="at_least"),
             CheckCounterAvailable(),
             ActionLeaf(Action.COUNTER)
         ]),
+        # Il Mago ora prende 3 SP a botta. Il traguardo è 6.
+        # CheckNeedsSP assicura che si buffi esattamente due volte.
         Sequence([
-            CheckHealthRatio(0.45, mode="above"),
+            CheckHealthRatio(0.30, mode="above"),
             CheckNeedsSP(),
             ActionLeaf(Action.BUFF)
         ]),
@@ -184,9 +189,10 @@ def build_ranger_tree():
             CheckCounterAvailable(),
             ActionLeaf(Action.COUNTER)
         ]),
+        # Rimosso CheckNeedsSP! Il Ranger si buffa per i danni (+4), non per gli SP.
+        # Deve solo controllare di non sovrascrivere un buff già attivo.
         Sequence([
-            CheckHealthRatio(0.50, mode="above"),
-            CheckNeedsSP(),
+            CheckHealthRatio(0.40, mode="above"),
             CheckBuffActive(),
             ActionLeaf(Action.BUFF)
         ]),
@@ -206,5 +212,66 @@ class BehaviorTreeAI:
         char = state.npc if npc_role == "npc" else state.player
         char_class = getattr(char, "char_class", None) or getattr(state, f"selected_{npc_role}_class", "Warrior")
         tree = self.trees.get(char_class, self.trees["Warrior"])
-        _, action = tree.tick(state, npc_role)
-        return action if action else Action.ATTACK
+        
+        # 1. Chiedi all'albero la mossa tattica ideale
+        _, bt_action = tree.tick(state, npc_role)
+        chosen_action = bt_action if bt_action else Action.ATTACK
+
+        # 2. Imprevedibilità (25% di probabilità)
+        if random.random() < 0.25:
+            valid_actions = [Action.ATTACK, Action.DEFEND, Action.BUFF]
+            
+            # Aggiungi SPECIAL solo se pronta
+            if char.sp >= char.stats["sp_threshold"]:
+                valid_actions.append(Action.SPECIAL)
+                
+            # Aggiungi COUNTER solo se il cooldown è a 0
+            if getattr(char, "counter_cooldown", 0) == 0:
+                valid_actions.append(Action.COUNTER)
+            
+            # Rimuovi la mossa originale per forzare una variazione reale
+            if chosen_action in valid_actions and len(valid_actions) > 1:
+                valid_actions.remove(chosen_action)
+                
+            # Pesca a caso tra le opzioni rimaste
+            chosen_action = random.choice(valid_actions)
+
+        return chosen_action
+    
+class BehaviorTreeAI:
+    def __init__(self):
+        self.trees = {
+            "Warrior": build_warrior_tree(),
+            "Mage": build_mage_tree(),
+            "Ranger": build_ranger_tree()
+        }
+
+    def decide_action(self, state, npc_role="npc"):
+        char = state.npc if npc_role == "npc" else state.player
+        char_class = getattr(char, "char_class", None) or getattr(state, f"selected_{npc_role}_class", "Warrior")
+        tree = self.trees.get(char_class, self.trees["Warrior"])
+        
+        # 1. Chiedi all'albero la mossa tattica ideale
+        _, bt_action = tree.tick(state, npc_role)
+        chosen_action = bt_action if bt_action else Action.ATTACK
+
+        # 2. Imprevedibilità (25% di probabilità)
+        if random.random() < 0.25:
+            valid_actions = [Action.ATTACK, Action.DEFEND, Action.BUFF]
+            
+            # Aggiungi SPECIAL solo se pronta
+            if char.sp >= char.stats["sp_threshold"]:
+                valid_actions.append(Action.SPECIAL)
+                
+            # Aggiungi COUNTER solo se il cooldown è a 0
+            if getattr(char, "counter_cooldown", 0) == 0:
+                valid_actions.append(Action.COUNTER)
+            
+            # Rimuovi la mossa originale per forzare una variazione reale
+            if chosen_action in valid_actions and len(valid_actions) > 1:
+                valid_actions.remove(chosen_action)
+                
+            # Pesca a caso tra le opzioni rimaste
+            chosen_action = random.choice(valid_actions)
+
+        return chosen_action

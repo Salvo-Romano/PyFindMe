@@ -1,9 +1,9 @@
 from enum import Enum
 
 CLASS_STATS = {
-    "Warrior": {"max_hp": 70, "base_dmg": 8, "special_dmg": 18, "counter_crit": 14, "counter_weak": 5, "buff_def_val": 4, "sp_threshold": 6},
-    "Mage":    {"max_hp": 50, "base_dmg": 4,  "special_dmg": 22, "counter_crit": 10, "counter_weak": 3, "buff_sp_val": 2,  "sp_threshold": 8},
-    "Ranger":  {"max_hp": 60, "base_dmg": 6,  "special_dmg": 14, "counter_crit": 12, "counter_weak": 4, "buff_atk_val": 4, "sp_threshold": 6}
+    "Warrior": {"max_hp": 70, "base_dmg": 5, "special_dmg": 18, "counter_crit": 10, "counter_weak": 3, "buff_def_val": 2, "sp_threshold": 6},
+    "Mage":    {"max_hp": 55, "base_dmg": 4,  "special_dmg": 28, "counter_crit": 12, "counter_weak": 4, "buff_sp_val": 3,  "sp_threshold": 6},
+    "Ranger":  {"max_hp": 60, "base_dmg": 6,  "special_dmg": 14, "counter_crit": 12, "counter_weak": 4, "buff_atk_val": 4, "sp_threshold": 4}
 }
 
 

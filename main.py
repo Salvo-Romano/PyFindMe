@@ -8,6 +8,8 @@ from ui_elements import draw_button, draw_character_hud
 from vfx import draw_pixel_shatter, draw_clash_overlay
 from projectiles import ArrowManager
 from ai_behavior_tree import BehaviorTreeAI
+from vitamin_client import VitaminClient
+from ai_logic import PureLogicAI
 from background_manager import BackgroundManager
 
 ACTION_COLORS = {
@@ -77,6 +79,8 @@ class GameGUI:
 
         # Modello utente e ispezione albero
         self.user_predictor = UserPredictor()
+        self.vitamin_client = VitaminClient(api_key="821b5bd238df54433364778326920866cca018890e4b4ccc2391853eefedc56e")
+        self.logic_ai = PureLogicAI(self.vitamin_client, self.user_predictor)
         self.tree_viewer = TreeViewer()
         self.horizon_tree = None
         self.show_tree_overlay = False
@@ -182,13 +186,18 @@ class GameGUI:
         if self.selected_ai == "Behavior Tree":
             self.state.npc.char_class = self.selected_npc_class
             npc_action = self.bt_ai.decide_action(self.state, npc_role="npc")
+            
+        elif self.selected_ai == "Pure Logic":
+            self.state.npc.char_class = self.selected_npc_class
+            npc_action = self.logic_ai.decide_action(self.state)
+            
         else:
             npc_action = Action.DEFEND
             
         self.last_result = self.state.apply_action_resolution(self.player_action, npc_action)
 
         # 2. Ricostruisce l'albero di transizione per il monitoraggio a orizzonte finito
-        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=3)
+        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=2)
         
         p_state = ANIM_STATE_MAP.get(self.player_action, "idle")
         n_state = ANIM_STATE_MAP.get(npc_action, "idle")
