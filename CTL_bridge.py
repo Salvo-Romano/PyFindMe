@@ -1,11 +1,31 @@
 import copy
 from pyFighters import Action, LogicFightersState
 
+# --- UTILITIES DI ASTRAZIONE ---
+def discretize_hp(hp, max_hp):
+    if hp <= 0:
+        return 0  # MORTO
+    
+    ratio = hp / max_hp
+    if ratio <= 0.30:
+        return 1  # CRITICO 
+    elif ratio <= 0.70:
+        return 2  # MEDIO
+    else:
+        return 3  # ALTO
+
+def discretize_special(special, max_sp):
+    if special >= max_sp:
+        return 2  # PRONTO 
+    elif special > 0:
+        return 1  # IN CARICA
+    else:
+        return 0  # VUOTO
+
+
 class UserPredictor:
     def __init__(self):
         self.actions = [Action.ATTACK, Action.DEFEND, Action.COUNTER, Action.BUFF]
-        # Tabelle di frequenza condizionate dallo stato
-        # Contesti: 'neutral', 'special_ready', 'critical_hp'
         self.counts = {
             "neutral": {a: 1.0 for a in self.actions},
             "special_ready": {Action.ATTACK: 4.0, Action.SPECIAL: 6.0, Action.DEFEND: 1.0, Action.COUNTER: 1.0, Action.BUFF: 1.0},
@@ -29,7 +49,6 @@ class UserPredictor:
         ctx = self._get_context(player)
         table = self.counts[ctx]
         
-        # Filtra azioni disponibili
         avail = [Action.DEFEND, Action.COUNTER, Action.BUFF]
         if player.sp >= player.stats["sp_threshold"]:
             avail.append(Action.SPECIAL)
@@ -45,59 +64,40 @@ class StateTreeNode:
         self.state = state_snapshot
         self.depth = depth
         self.prob = parent_prob
-        # transizioni: lista di tuple (a_P, a_N, prob_transizione, child_node)
         self.transitions = []
         self.atomic_props = self._evaluate_atomic_props()
 
-    '''def _evaluate_atomic_props(self):
+    def _evaluate_atomic_props(self):
         p, n = self.state.player, self.state.npc
         props = set()
         
-        # --- Sopravvivenza ---
+        # Le proposizioni ora possono usare direttamente le stesse regole di discretizzazione per coerenza
         if p.hp <= 0: props.add("Dead_P")
         if n.hp <= 0: props.add("Dead_N")
         if n.hp > 0: props.add("Alive_N") 
-        if p.hp <= int(p.stats["max_hp"] * 0.3): props.add("LowHP_P")
-        if n.hp <= int(n.stats["max_hp"] * 0.3): props.add("LowHP_N")
+        if discretize_hp(p.hp, p.stats["max_hp"]) == 1: props.add("LowHP_P")
+        if discretize_hp(n.hp, n.stats["max_hp"]) == 1: props.add("LowHP_N")
         
-        
-        # --- Vantaggio ---
         if n.hp > p.hp: props.add("HP_Advantage_N")
         
-        # --- Speciali e Minacce ---
-        # Player
         if p.sp >= p.stats["sp_threshold"]: props.add("SpecialReady_P")
         elif p.sp >= p.stats["sp_threshold"] - 2: props.add("SpecialDanger_P")
-        # NPC
+        
         if n.sp >= n.stats["sp_threshold"]: props.add("SpecialReady_N")
         elif n.sp >= n.stats["sp_threshold"] - 2: props.add("SpecialDanger_N")
         
-        # --- Stato dei Buff ---
         if p.def_buff_turns > 0: props.add("DefBuff_P")
         if p.atk_buff_turns > 0: props.add("AtkBuff_P")
         if n.def_buff_turns > 0: props.add("DefBuff_N")
         if n.atk_buff_turns > 0: props.add("AtkBuff_N")
         
-        # --- Cooldowns ---
-        # Uso getattr per evitare crash nel caso in cui counter_cooldown non fosse stato inizializzato
         if getattr(p, "counter_cooldown", 0) == 0: props.add("CounterReady_P")
         if getattr(n, "counter_cooldown", 0) == 0: props.add("CounterReady_N")
         
-        return props'''
-        
-    def _evaluate_atomic_props(self):
-        p, n = self.state.player, self.state.npc
-        props = set()
-        
-        # Modello dummy minimale per testare la pipeline
-        if n.hp > 0: 
-            props.add("Alive_N")
-            
         return props
 
 
 def clone_state(base_state):
-    """Copia profonda dello stato per la simulazione a passi in avanti."""
     new_s = LogicFightersState(base_state.player.char_class, base_state.npc.char_class)
     new_s.turn = base_state.turn
     new_s.player = copy.deepcopy(base_state.player)
@@ -108,49 +108,27 @@ def get_state_signature(state, current_depth):
     p = state.player
     n = state.npc
     
-    # La tupla rappresenta l'impronta digitale univoca dello stato
+    # LA MAGIA DELL'ASTRAZIONE: Usiamo le fasce per comprimere i macro-stati nel DAG
     return (
         current_depth,
-        p.hp, p.sp, getattr(p, "atk_buff_turns", 0), getattr(p, "def_buff_turns", 0), getattr(p, "counter_cooldown", 0),
-        n.hp, n.sp, getattr(n, "atk_buff_turns", 0), getattr(n, "def_buff_turns", 0), getattr(n, "counter_cooldown", 0)
+        discretize_hp(p.hp, p.stats["max_hp"]), discretize_special(p.sp, p.stats["sp_threshold"]), getattr(p, "atk_buff_turns", 0), getattr(p, "def_buff_turns", 0), getattr(p, "counter_cooldown", 0),
+        discretize_hp(n.hp, n.stats["max_hp"]), discretize_special(n.sp, n.stats["sp_threshold"]), getattr(n, "atk_buff_turns", 0), getattr(n, "def_buff_turns", 0), getattr(n, "counter_cooldown", 0)
     )
-    
-def get_action_code(action):
-    # Mappa l'enum Action al singolo carattere
-    mapping = {
-        Action.ATTACK: "A",
-        Action.DEFEND: "D",
-        Action.COUNTER: "C",
-        Action.BUFF: "B",
-        Action.SPECIAL: "S"
-    }
-    return mapping.get(action, "U")
-
-def format_joint_action(action_p1, action_p2):
-    # Unisce i codici. Esempio: ATTACK e DEFEND diventano "AD"
-    code_p1 = get_action_code(action_p1)
-    code_p2 = get_action_code(action_p2)
-    return f"{code_p1}{code_p2}"
 
 def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, current_prob=1.0, prune_threshold=0.08, memo=None, use_dag=True):
-    # Inizializziamo il dizionario solo se stiamo usando il DAG e siamo alla radice
     if use_dag and memo is None:
         memo = {}
         
-    # 1. Se usiamo il DAG, calcoliamo la firma e cerchiamo nel dizionario
     if use_dag:
         signature = get_state_signature(current_state, cur_depth)
         if signature in memo:
             return memo[signature]
             
-    # 2. Creazione del nuovo nodo (sia per Tree che per DAG)
     node = StateTreeNode(current_state, depth=cur_depth, parent_prob=current_prob)
     
-    # 3. Se usiamo il DAG, salviamo il nodo appena creato per i futuri rami
     if use_dag:
         memo[signature] = node
     
-    # Condizione di uscita dalla ricorsione
     if cur_depth >= max_depth or current_state.is_finished():
         return node
 
@@ -175,7 +153,6 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
             joint_prob = prob_p / num_npc_actions
             branch_prob = current_prob * joint_prob
             
-            # Passiamo il flag use_dag e il dizionario memo ai figli
             child_node = build_horizon_tree(
                 next_s, user_predictor,
                 max_depth=max_depth,
@@ -183,15 +160,13 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
                 current_prob=branch_prob,
                 prune_threshold=prune_threshold,
                 memo=memo,
-                use_dag=use_dag # <--- Propagazione del flag
+                use_dag=use_dag 
             )
             node.transitions.append((a_p, a_n, joint_prob, child_node))
 
     return node
 
-
 def generate_vitamin_model(root_node):
-    # 1. Raccogli tutti i nodi unici nell'albero (Visita in profondità/DFS)
     nodes = []
     def collect_nodes(node):
         if node not in nodes:
@@ -201,34 +176,26 @@ def generate_vitamin_model(root_node):
                 
     collect_nodes(root_node)
     
-    # 2. Assegna nomi agli stati e raccogli tutte le Proposizioni Atomiche (AP)
     state_names = [f"s{i}" for i in range(len(nodes))]
     all_aps = set()
     for n in nodes:
         all_aps.update(n.atomic_props)
     all_aps = sorted(list(all_aps))
     
-    # Fallback di sicurezza: VITAMIN fallisce se non c'è almeno una AP
     if not all_aps:
         all_aps = ["neutral"]
         for n in nodes:
             n.atomic_props.add("neutral")
 
-    # 3. Costruisci la Matrice di Transizione (|S| x |S|)
     matrix = [["0" for _ in nodes] for _ in nodes]
     for i, node in enumerate(nodes):
         if not node.transitions:
-            # I model checker CTL richiedono transizioni totali (nessun vicolo cieco)
-            # Aggiungiamo un auto-anello (self-loop) sugli stati foglia
-            matrix[i][i] = "loop"
+            matrix[i][i] = "1" # Anche il loop deve essere 1, non la stringa "loop"
         else:
             for ap_action, npc_action, _, child in node.transitions:
                 j = nodes.index(child)
-                # Inseriamo un'etichetta per l'azione (es. Atk_Def) per debug visivo
-                action_label = format_joint_action(ap_action, npc_action)
-                matrix[i][j] = action_label
+                matrix[i][j] = "1" # CRITICO: Solo "1", nessuna etichetta stringa!
 
-    # 4. Genera il file di testo seguendo rigorosamente la sintassi
     lines = []
     
     lines.append("Transition")
@@ -257,7 +224,6 @@ def generate_vitamin_model(root_node):
     return "\n".join(lines)
 
 def parse_vitamin_trace(response_json, root_node):
-    # Prendiamo direttamente tutti i nodi considerati validi dal solver
     verification = response_json.get("verification", {})
     trace_states = verification.get("satisfying_states", [])
     
