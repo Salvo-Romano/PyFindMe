@@ -42,7 +42,7 @@ class GameGUI:
         self.fullscreen = False
         
         self.screen = pygame.display.set_mode((self.width, self.height))
-        pygame.display.set_caption("LogicFighters - Neuro-Symbolic Prototype")
+        pygame.display.set_caption("LogicFighters - Formal Logic Prototype")
         self.clock = pygame.time.Clock()
 
         self.font_main = pygame.font.SysFont("verdana", 48)
@@ -51,7 +51,7 @@ class GameGUI:
 
         self.selected_player_class = "Warrior"
         self.selected_npc_class = "Mage"
-        self.selected_ai = "Behavior Tree"
+        self.selected_ai = "Pure Logic"
         
         self.current_scene = "menu"
         self.state = None
@@ -77,13 +77,21 @@ class GameGUI:
         self.bt_ai = BehaviorTreeAI()
         self.bg_manager = BackgroundManager("Backgrounds", (self.width, self.height))
 
-        # Modello utente e ispezione albero
         self.user_predictor = UserPredictor()
         self.vitamin_client = VitaminClient(api_key="821b5bd238df54433364778326920866cca018890e4b4ccc2391853eefedc56e")
         self.logic_ai = PureLogicAI(self.vitamin_client, self.user_predictor)
         self.tree_viewer = TreeViewer()
         self.horizon_tree = None
         self.show_tree_overlay = False
+        
+        # NUOVA VARIABILE PER ASINCRONIA
+        self.waiting_for_ai = False
+        
+        self.last_executed_p_action = None
+        self.last_executed_n_action = None
+        
+        COOLDOWN_ACTIONS = [Action.COUNTER]
+        
         self.update_ui_layout()
 
     def update_ui_layout(self):
@@ -140,7 +148,6 @@ class GameGUI:
         self.victory_button = pygame.Rect(cx - 120, cy + 60, 240, 50)
 
     def start_battle(self):
-        # Genera una combinazione casuale ad ogni match
         self.bg_manager.generate_random_scene()
         self.pending_arrows.clear()
         self.state = LogicFightersState(self.selected_player_class, self.selected_npc_class)
@@ -148,9 +155,16 @@ class GameGUI:
         self.last_result = None
         self.player_action = Action.ATTACK
         self.is_paused = False
+        self.waiting_for_ai = False  # Reset flag asincrono
         self.arrow_manager.arrows.clear()
 
-        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=2)
+        self.horizon_tree = build_horizon_tree(
+            self.state, 
+            self.user_predictor, 
+            max_depth=2, 
+            last_p_act=self.last_executed_p_action, 
+            last_n_act=self.last_executed_n_action
+        )
         
         self.player_animator = build_animator(self.selected_player_class, scale=3.0, facing_right=True)
         self.npc_animator = build_animator(self.selected_npc_class, scale=3.0, facing_right=False)
@@ -180,24 +194,51 @@ class GameGUI:
         return (spawn_x, spawn_y)
 
     def resolve_turn(self):
-        # 1. Registra l'azione reale dell'utente per aggiornare P(a_P | s)
-        self.user_predictor.record_action(self.state.player, self.player_action)
+        # 1. Registra l'azione, ma evita spam se il thread sta calcolando
+        if self.waiting_for_ai:
+            return
 
         if self.selected_ai == "Behavior Tree":
             self.state.npc.char_class = self.selected_npc_class
             npc_action = self.bt_ai.decide_action(self.state, npc_role="npc")
+            self.finalize_turn(npc_action)
             
         elif self.selected_ai == "Pure Logic":
             self.state.npc.char_class = self.selected_npc_class
-            npc_action = self.logic_ai.decide_action(self.state)
+            npc_action = self.logic_ai.decide_action(self.state, last_player_action=self.last_executed_p_action, last_npc_action=self.last_executed_n_action)
             
+            # Se la cache fa miss, l'IA avvia il thread e restituisce THINKING
+            if npc_action == "THINKING":
+                self.waiting_for_ai = True
+            else:
+                self.finalize_turn(npc_action)
+                
         else:
-            npc_action = Action.DEFEND
-            
-        self.last_result = self.state.apply_action_resolution(self.player_action, npc_action)
+            self.finalize_turn(Action.DEFEND)
 
-        # 2. Ricostruisce l'albero di transizione per il monitoraggio a orizzonte finito
-        self.horizon_tree = build_horizon_tree(self.state, self.user_predictor, max_depth=2)
+    def finalize_turn(self, npc_action):
+        # Questa funzione viene chiamata o istantaneamente dalla cache, 
+        # oppure dal loop principale non appena il thread asincrono termina
+        
+        self.user_predictor.record_action(self.state.player, self.player_action)
+        
+        self.last_executed_p_action = self.player_action
+        self.last_executed_n_action = npc_action
+        
+        self.last_result = self.state.apply_action_resolution(self.player_action, npc_action)
+        
+        # Sposta la selezione su un'azione sicura se la corrente è appena andata in cooldown
+        valid_actions = [a for a, d in self.get_active_buttons().items() if not d["disabled"]]
+        if self.player_action not in valid_actions and valid_actions:
+            self.player_action = valid_actions[0]
+
+        self.horizon_tree = build_horizon_tree(
+            self.state, 
+            self.user_predictor, 
+            max_depth=2, 
+            last_p_act=self.last_executed_p_action, 
+            last_n_act=self.last_executed_n_action
+        )
         
         p_state = ANIM_STATE_MAP.get(self.player_action, "idle")
         n_state = ANIM_STATE_MAP.get(npc_action, "idle")
@@ -258,7 +299,6 @@ class GameGUI:
         p_origin = self.get_projectile_spawn_point("player", p_rect)
         n_origin = self.get_projectile_spawn_point("npc", n_rect)
 
-        # Sostituisci le chiamate dirette spawn_shot con l'accodamento
         arrow_release_delay = 250
 
         if self.selected_player_class == "Ranger":
@@ -297,9 +337,28 @@ class GameGUI:
         start_x = (self.width // 2) - (total_width // 2)
         y_pos = self.height - 120
         
+        # Calcoliamo i turni rimanenti del buff (il massimo tra atk e def buff)
+        active_buff_turns = max(p1.def_buff_turns, p1.atk_buff_turns)
+        
         for i, action in enumerate(actions):
             x = start_x + (i * (btn_width + spacing))
-            buttons[action] = pygame.Rect(x, y_pos, btn_width, btn_height)
+            
+            is_cooldown = False
+            cooldown_turns = 0
+            
+            if action == Action.COUNTER and getattr(self, 'last_executed_p_action', None) == Action.COUNTER:
+                is_cooldown = True
+                cooldown_turns = 1  # Il counter torna sempre disponibile dopo 1 turno
+                
+            if action == Action.BUFF and active_buff_turns > 0:
+                is_cooldown = True
+                cooldown_turns = active_buff_turns # Passiamo i turni esatti (2 o 1)
+            
+            buttons[action] = {
+                "rect": pygame.Rect(x, y_pos, btn_width, btn_height),
+                "disabled": is_cooldown,
+                "cooldown_turns": cooldown_turns
+            }
         return buttons
 
     def draw_menu(self):
@@ -401,51 +460,64 @@ class GameGUI:
                 actions[key]()
 
     def draw_battle(self):
-        # Rendering Sfondo
         self.bg_manager.draw(self.screen)
 
-        # HUD Player (Sinistra)
+        # HUD Player
         draw_character_hud(
             self.screen, self.font_sub, self.font_small,
             pos=(60, 40),
             current_hp=self.state.player.hp, max_hp=self.state.player.stats["max_hp"],
             current_sp=self.state.player.sp, max_sp=self.state.player.stats["sp_threshold"],
-            title="HERO", subtitle=self.selected_player_class,
-            is_right_aligned=False
+            title="Wiser", subtitle=self.selected_player_class,
+            is_right_aligned=False,
+            atk_buff_turns=self.state.player.atk_buff_turns,
+            def_buff_turns=self.state.player.def_buff_turns  
         )
 
-        # HUD NPC (Destra - a specchio)
+        # HUD NPC
         draw_character_hud(
             self.screen, self.font_sub, self.font_small,
             pos=(self.width - 60, 40),
             current_hp=self.state.npc.hp, max_hp=self.state.npc.stats["max_hp"],
             current_sp=self.state.npc.sp, max_sp=self.state.npc.stats["sp_threshold"],
-            title="EVIL GUY", subtitle=self.selected_npc_class,
-            is_right_aligned=True
+            title="Evilon", subtitle=self.selected_npc_class,
+            is_right_aligned=True,
+            atk_buff_turns=self.state.npc.atk_buff_turns,    
+            def_buff_turns=self.state.npc.def_buff_turns     
         )
         
-        # Fascia di contrasto inferiore per i controlli
         bar_h = 130
         bottom_bar = pygame.Surface((self.width, bar_h), pygame.SRCALPHA)
         bottom_bar.fill((10, 12, 18, 200))
         pygame.draw.line(bottom_bar, (40, 50, 70), (0, 0), (self.width, 0), 2)
         self.screen.blit(bottom_bar, (0, self.height - bar_h))
         
+        
         # Bottoni azioni
-        for action, rect in self.get_active_buttons().items():
-            draw_button(self.screen, self.font_sub, rect, action.name, fill=ACTION_COLORS[action], selected=(self.player_action == action))
-
-        # Info turno con outline nero a 4 direzioni per massima leggibilità
+        for action, data in self.get_active_buttons().items():
+            rect = data["rect"]
+            disabled = data["disabled"]
+            cooldown_turns = data["cooldown_turns"]
+            
+            if disabled:
+                # Bottone grigio scuro
+                draw_button(self.screen, self.font_sub, rect, action.name, fill=(60, 60, 65), selected=False)
+                # Testo di avviso cooldown con numero dinamico dei turni
+                hint_text = f"Cooldown ({cooldown_turns})"
+                hint = self.font_small.render(hint_text, True, (220, 80, 80))
+                self.screen.blit(hint, hint.get_rect(center=(rect.centerx, rect.bottom + 10)))
+            else:
+                draw_button(self.screen, self.font_sub, rect, action.name, fill=ACTION_COLORS[action], selected=(self.player_action == action))
+                
+                
         if self.last_result:
             info_str = f"Turn {self.last_result['turn']-1} | Player: {self.last_result['player_damage']} dmg | NPC: {self.last_result['npc_damage']} dmg"
             center_pos = (self.width // 2, self.height // 2)
             
-            # Rendering del bordo nero
             outline_surf = self.font_sub.render(info_str, True, (0, 0, 0))
             for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
                 self.screen.blit(outline_surf, outline_surf.get_rect(center=(center_pos[0] + dx, center_pos[1] + dy)))
             
-            # Testo bianco pieno sopra
             info_surf = self.font_sub.render(info_str, True, (245, 245, 245))
             self.screen.blit(info_surf, info_surf.get_rect(center=center_pos))
             
@@ -500,7 +572,11 @@ class GameGUI:
             
             draw_button(self.screen, self.font_sub, self.victory_button, "Return to Menu", fill=(40, 100, 180))
         else:
-            hint = self.font_small.render("Press SPACE to resolve turn (ESC for Pause)", True, (120, 130, 140))
+            # TEXT FEEDBACK PER IL THREAD IN BACKGROUND
+            if self.waiting_for_ai:
+                hint = self.font_small.render("Ai Computing Formal Proof...", True, (255, 200, 50))
+            else:
+                hint = self.font_small.render("Press SPACE to resolve turn (ESC for Pause)", True, (120, 130, 140))
             self.screen.blit(hint, hint.get_rect(center=(self.width // 2, self.height - 40)))
             
         if self.is_paused:
@@ -515,11 +591,9 @@ class GameGUI:
             draw_button(self.screen, self.font_sub, self.pause_buttons["quit_battle"], "Quit Battle", fill=(180, 120, 40))
             draw_button(self.screen, self.font_sub, self.pause_buttons["quit_game"], "Quit Game", fill=(180, 40, 40))
 
-        # Disegna il pulsante di ispezione nell'angolo inferiore
         inspect_btn = pygame.Rect(self.width - 200, self.height - 50, 180, 36)
         draw_button(self.screen, self.font_small, inspect_btn, "Inspect Tree [T]", fill=(45, 60, 85))
 
-        # Se attivo, disegna l'albero in sovraimpressione
         if self.show_tree_overlay and self.horizon_tree:
             self.tree_viewer.draw(
                 self.screen, self.horizon_tree,
@@ -546,8 +620,10 @@ class GameGUI:
                     raise SystemExit
             return
 
+        # BLOCCA L'INPUT SE L'IA STA CALCOLANDO
         if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE and not self.state.is_finished():
-            self.resolve_turn()
+            if not self.waiting_for_ai:
+                self.resolve_turn()
 
         if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
             self.show_tree_overlay = not self.show_tree_overlay
@@ -571,8 +647,8 @@ class GameGUI:
                 self.current_scene = "menu"
                 return
 
-            for action, rect in self.get_active_buttons().items():
-                if rect.collidepoint(event.pos):
+            for action, data in self.get_active_buttons().items():
+                if data["rect"].collidepoint(event.pos) and not data["disabled"]:
                     self.player_action = action
                     break
 
@@ -600,6 +676,14 @@ class GameGUI:
                     self.handle_battle_events(event)
 
             if self.current_scene == "battle" and not self.is_paused:
+                
+                # LOOP DI CONTROLLO ASINCRONO: interroga l'IA ogni frame se stiamo aspettando
+                if self.waiting_for_ai:
+                    npc_action = self.logic_ai.decide_action(self.state, last_player_action=self.player_action)
+                    if npc_action != "THINKING":
+                        self.waiting_for_ai = False
+                        self.finalize_turn(npc_action)
+
                 self.arrow_manager.update(dt)
                 
                 for p in self.pending_arrows:
@@ -610,7 +694,6 @@ class GameGUI:
                         elif p["type"] == "rain":
                             self.arrow_manager.spawn_rain(p["x"], p["y"])
                 self.pending_arrows = [p for p in self.pending_arrows if p["timer"] > 0]
-                
                 
                 if self.fx_delay_timer > 0:
                     self.fx_delay_timer -= dt

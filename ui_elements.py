@@ -17,7 +17,7 @@ def draw_text_with_outline(surface, font, text, color, outline_color, pos, align
         surface.blit(outline_surf, (rect.x + dx, rect.y + dy))
     surface.blit(text_surf, rect)
 
-def draw_character_hud(surface, font_title, font_stats, pos, current_hp, max_hp, current_sp, max_sp, title="PLAYER", subtitle="Warrior", is_right_aligned=False):
+def draw_character_hud(surface, font_title, font_stats, pos, current_hp, max_hp, current_sp, max_sp, title="PLAYER", subtitle="Warrior", is_right_aligned=False, atk_buff_turns=0, def_buff_turns=0):
     # Dimensioni coerenti
     bar_w, bar_h = 240, 18
     diamond_size = 14
@@ -46,6 +46,22 @@ def draw_character_hud(surface, font_title, font_stats, pos, current_hp, max_hp,
     
     full_title = f"{title} [{subtitle}]"
     draw_text_with_outline(surface, font_title, full_title, title_color, (5, 5, 10), title_pos, align=align_side)
+
+    # --- DISEGNO INDICATORI BUFF ---
+    buffs = []
+    if def_buff_turns > 0: buffs.append(("^ DEF", (100, 200, 255)))
+    if atk_buff_turns > 0: buffs.append(("^ ATK", (255, 100, 100)))
+    
+    b_offset = 0
+    for b_text, b_col in buffs:
+        b_surf = font_stats.render(b_text, True, b_col)
+        if not is_right_aligned:
+            bx = x + box_w - padding - b_offset - b_surf.get_width()
+        else:
+            bx = x + padding + b_offset
+        surface.blit(b_surf, (bx, y + 18))
+        b_offset += b_surf.get_width() + 10
+    # -------------------------------
 
     # 3. Barra HP con bordo metallico e sfumatura
     bar_x = x + (box_w - bar_w - padding) if is_right_aligned else x + padding

@@ -105,44 +105,113 @@ def clone_state(base_state):
     return new_s
 
 def get_state_signature(state, current_depth):
-    p = state.player
-    n = state.npc
+    """
+    Comprime lo stato in una firma a bassa cardinalità per massimizzare
+    i cache hit (Match) ed evitare lo State Space Explosion, 
+    mantenendo 4 fasce di salute per preservare i dettagli tattici.
+    """
+    def abstract_hp(hp, max_hp):
+        ratio = hp / max_hp if max_hp > 0 else 0
+        if ratio > 0.75: return 3  # Ottima salute
+        if ratio > 0.50: return 2  # Buona salute
+        if ratio > 0.25: return 1  # Ferito / Attenzione
+        return 0                   # Critico
+
+    def abstract_sp(sp, threshold):
+        if sp >= threshold: return 2 # Special Pronta
+        if sp > 0: return 1          # In Carica
+        return 0                     # Vuoto
+
+    p1, p2 = state.player, state.npc
     
-    # LA MAGIA DELL'ASTRAZIONE: Usiamo le fasce per comprimere i macro-stati nel DAG
     return (
         current_depth,
-        discretize_hp(p.hp, p.stats["max_hp"]), discretize_special(p.sp, p.stats["sp_threshold"]), getattr(p, "atk_buff_turns", 0), getattr(p, "def_buff_turns", 0), getattr(p, "counter_cooldown", 0),
-        discretize_hp(n.hp, n.stats["max_hp"]), discretize_special(n.sp, n.stats["sp_threshold"]), getattr(n, "atk_buff_turns", 0), getattr(n, "def_buff_turns", 0), getattr(n, "counter_cooldown", 0)
+        
+        # Astrazione Player
+        abstract_hp(p1.hp, p1.stats["max_hp"]),
+        abstract_sp(p1.sp, p1.stats["sp_threshold"]),
+        1 if p1.atk_buff_turns > 0 else 0,
+        1 if p1.def_buff_turns > 0 else 0,
+        
+        # Astrazione NPC
+        abstract_hp(p2.hp, p2.stats["max_hp"]),
+        abstract_sp(p2.sp, p2.stats["sp_threshold"]),
+        1 if p2.atk_buff_turns > 0 else 0,
+        1 if p2.def_buff_turns > 0 else 0
     )
 
-def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, current_prob=1.0, prune_threshold=0.08, memo=None, use_dag=True):
+def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, current_prob=1.0, prune_threshold=0.15, memo=None, use_dag=True, last_p_act=None, last_n_act=None):
     if use_dag and memo is None:
         memo = {}
         
     if use_dag:
         signature = get_state_signature(current_state, cur_depth)
-        if signature in memo:
-            return memo[signature]
+        memo_key = (signature, last_p_act, last_n_act)
+        
+        if memo_key in memo:
+            return memo[memo_key]
             
     node = StateTreeNode(current_state, depth=cur_depth, parent_prob=current_prob)
     
     if use_dag:
-        memo[signature] = node
-    
+        memo[memo_key] = node
+        
     if cur_depth >= max_depth or current_state.is_finished():
         return node
 
     p_dist = user_predictor.get_distribution(current_state.player)
     
+    # --- 1. APPLICAZIONE REGOLE E NORMALIZZAZIONE PLAYER ---
+    COOLDOWN_ACTIONS = [Action.COUNTER]
+    adjusted_p_dist = {}
+    
+    # Check Buff Player: Il buff dura finché "def_buff_turns" > 0 (adatta al nome della tua variabile)
+    # Assumo che esista un attributo simile a 'def_buff_turns' basandomi sulla tua logica
+    p_has_buff = current_state.player.def_buff_turns > 0 or current_state.player.atk_buff_turns > 0
+    
+    for a_p, prob in p_dist.items():
+        if last_p_act in COOLDOWN_ACTIONS and a_p == last_p_act:
+            continue
+            
+        if p_has_buff and a_p == Action.BUFF:
+            continue
+            
+        if a_p == last_p_act:
+            prob *= 0.70 
+            
+        adjusted_p_dist[a_p] = adjusted_p_dist.get(a_p, 0.0) + prob
+        
+    # Regola A (Migliorata): Trasferimento e Boost per la Special
+    if current_state.player.sp >= current_state.player.stats["sp_threshold"]:
+        attack_prob = adjusted_p_dist.pop(Action.ATTACK, 0.0)
+        special_prob = adjusted_p_dist.get(Action.SPECIAL, 0.0)
+        
+        # Uniamo i valori e diamo un bonus psicologico del 50% alla voglia di usare la special
+        boosted_special = (attack_prob + special_prob) * 1.5 
+        adjusted_p_dist[Action.SPECIAL] = boosted_special
+
+    # Normalizzazione finale Player
+    total_prob = sum(adjusted_p_dist.values())
+    if total_prob > 0:
+        adjusted_p_dist = {k: v / total_prob for k, v in adjusted_p_dist.items()}
+
+    # --- 2. APPLICAZIONE REGOLE NPC ---
     npc_actions = [Action.DEFEND, Action.COUNTER, Action.BUFF]
     if current_state.npc.sp >= current_state.npc.stats["sp_threshold"]:
         npc_actions.append(Action.SPECIAL)
     else:
         npc_actions.append(Action.ATTACK)
-
-    num_npc_actions = len(npc_actions)
-    
-    for a_p, prob_p in p_dist.items():
+        
+    if last_n_act in COOLDOWN_ACTIONS and last_n_act in npc_actions:
+        npc_actions.remove(last_n_act)
+        
+    # Check Buff NPC
+    n_has_buff = current_state.npc.def_buff_turns > 0 or current_state.npc.atk_buff_turns > 0
+    if n_has_buff and Action.BUFF in npc_actions:
+        npc_actions.remove(Action.BUFF)
+            
+    # --- 3. CREAZIONE RAMI ---
+    for a_p, prob_p in adjusted_p_dist.items():
         if prob_p < prune_threshold:
             continue
             
@@ -150,8 +219,7 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
             next_s = clone_state(current_state)
             next_s.apply_action_resolution(a_p, a_n)
             
-            joint_prob = prob_p / num_npc_actions
-            branch_prob = current_prob * joint_prob
+            branch_prob = current_prob * prob_p
             
             child_node = build_horizon_tree(
                 next_s, user_predictor,
@@ -160,12 +228,13 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
                 current_prob=branch_prob,
                 prune_threshold=prune_threshold,
                 memo=memo,
-                use_dag=use_dag 
+                use_dag=use_dag,
+                last_p_act=a_p,  # Propaga la mossa del nodo corrente al livello successivo
+                last_n_act=a_n
             )
-            node.transitions.append((a_p, a_n, joint_prob, child_node))
+            node.transitions.append((a_p, a_n, prob_p, child_node))
 
     return node
-
 def generate_vitamin_model(root_node):
     nodes = []
     def collect_nodes(node):
@@ -176,6 +245,10 @@ def generate_vitamin_model(root_node):
                 
     collect_nodes(root_node)
     
+    for node in nodes:
+        if not node.transitions:
+            node.atomic_props.add("Horizon")
+            
     state_names = [f"s{i}" for i in range(len(nodes))]
     all_aps = set()
     for n in nodes:
