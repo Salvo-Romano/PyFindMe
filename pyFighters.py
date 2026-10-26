@@ -76,7 +76,14 @@ class LogicFightersState:
             return attacker.stats["counter_crit"] if opponent_action == Action.DEFEND else attacker.stats["counter_weak"]
 
         return 0
-
+    
+    def is_buff_allowed(self, character):
+        if character.def_buff_turns > 0 or character.atk_buff_turns > 0:
+            return False
+        else:
+            return True
+        
+        
     def _apply_defense_and_buff(self, attacker, defender, action, opponent_action, damage):
         if opponent_action == Action.DEFEND and action != Action.COUNTER:
             damage //= 2

@@ -1,0 +1,20 @@
+==================================================
+🏆 TORNEO HEADLESS: BEHAVIOR TREE vs PURE LOGIC AI
+==================================================
+
+BT Warrior vs LOGIC Warrior -> BT: 0 (0%) | LOGIC: 8 (80%) | Stalli: 2 | Turni Medi: 17.1
+BT Warrior vs LOGIC Mage -> BT: 0 (0%) | LOGIC: 8 (80%) | Stalli: 2 | Turni Medi: 14.3
+BT Warrior vs LOGIC Ranger -> BT: 0 (0%) | LOGIC: 10 (100%) | Stalli: 0 | Turni Medi: 13.1
+BT Mage vs LOGIC Warrior -> BT: 1 (10%) | LOGIC: 9 (90%) | Stalli: 0 | Turni Medi: 11.8
+BT Mage vs LOGIC Mage -> BT: 0 (0%) | LOGIC: 10 (100%) | Stalli: 0 | Turni Medi: 10.3
+BT Mage vs LOGIC Ranger -> BT: 1 (10%) | LOGIC: 9 (90%) | Stalli: 0 | Turni Medi: 10.9
+BT Ranger vs LOGIC Warrior -> BT: 4 (40%) | LOGIC: 5 (50%) | Stalli: 1 | Turni Medi: 12.4
+BT Ranger vs LOGIC Mage -> BT: 0 (0%) | LOGIC: 9 (90%) | Stalli: 1 | Turni Medi: 12.4
+BT Ranger vs LOGIC Ranger -> BT: 1 (10%) | LOGIC: 9 (90%) | Stalli: 0 | Turni Medi: 10.6
+
+==================================================
+📊 RIASSUNTO GLOBALE
+==================================================
+Match Totali Giocati : 90
+Vittorie TOTALI BT   : 7 (7.8%)
+Vittorie TOTALI LOGIC: 77 (85.6%)

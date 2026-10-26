@@ -1,6 +1,6 @@
 import pygame
 import random
-from CTL_bridge import UserPredictor, build_horizon_tree, generate_vitamin_model
+from CTL_bridge import UserPredictor, generate_vitamin_model
 from tree_viewer import TreeViewer
 from pyFighters import Action, LogicFightersState
 from animator import build_animator
@@ -11,6 +11,11 @@ from ai_behavior_tree import BehaviorTreeAI
 from vitamin_client import VitaminClient
 from ai_logic import PureLogicAI
 from background_manager import BackgroundManager
+import torch
+import os # Opzionale, per controllare se il file dei pesi esiste
+from neuro_symbolic_env import CTLVocabulary, GrammarMasker
+from ai_neuro_symbolic import NeuroSymbolicAI
+
 
 ACTION_COLORS = {
     Action.ATTACK: (220, 60, 60),
@@ -79,20 +84,58 @@ class GameGUI:
 
         self.user_predictor = UserPredictor()
         self.vitamin_client = VitaminClient(api_key="821b5bd238df54433364778326920866cca018890e4b4ccc2391853eefedc56e")
-        self.logic_ai = PureLogicAI(self.vitamin_client, self.user_predictor)
+        
+        # 1. IA EURISTICA (Pure Logic)
+        self.pure_logic_ai = PureLogicAI(self.vitamin_client, self.user_predictor)
+        
+        # 2. IA NEURO-SIMBOLICA
+        atomic_props = ["Alive_N", "Dead_P", "LowHP_P", "SpecialReady_N", "HP_Advantage_N", "Horizon"]
+        self.vocab = CTLVocabulary(atomic_props)
+        self.masker = GrammarMasker(self.vocab)
+        self.neuro_symbolic_ai = NeuroSymbolicAI(self.vitamin_client, self.user_predictor, self.vocab, self.masker)
+        
+        # Caricamento dei pesi per l'IA Neuro-Simbolica
+        model_path = "neuro_symbolic_meta_controller.pth"
+        if os.path.exists(model_path):
+            self.neuro_symbolic_ai.policy_net.load_state_dict(torch.load(model_path))
+            self.neuro_symbolic_ai.policy_net.eval()
+            print("✅ [NEURO-SYMBOLIC] Pesi del Meta-Controller caricati con successo!")
+        else:
+            print("⚠️ [NEURO-SYMBOLIC] Modello .pth non trovato. Rete non addestrata.")
+
+        # Inizializziamo il riferimento all'IA attiva (cambierà in base alla selezione)
+        self.active_logic_ai = self.pure_logic_ai
+        
         self.tree_viewer = TreeViewer()
         self.horizon_tree = None
         self.show_tree_overlay = False
-        
-        # NUOVA VARIABILE PER ASINCRONIA
         self.waiting_for_ai = False
-        
+        # --------------------------------------------------------
         self.last_executed_p_action = None
         self.last_executed_n_action = None
         
         COOLDOWN_ACTIONS = [Action.COUNTER]
         
         self.update_ui_layout()
+        
+        
+        # 1. Definisci le proposizioni atomiche (DEVONO essere le stesse del training)
+        atomic_props = ["Alive_N", "Dead_P", "LowHP_P", "SpecialReady_N", "HP_Advantage_N", "Horizon"]
+        self.vocab = CTLVocabulary(atomic_props)
+        self.masker = GrammarMasker(self.vocab)
+        
+        # 2. Inizializza la nuova IA Neuro-Simbolica
+        # Assumendo che self.vitamin_client e self.user_predictor siano già stati creati
+        self.logic_ai = NeuroSymbolicAI(self.vitamin_client, self.user_predictor, self.vocab, self.masker)
+        
+        # 3. Carica la "memoria" (i pesi) se hai fatto il training!
+        model_path = "neuro_symbolic_meta_controller.pth"
+        if os.path.exists(model_path):
+            self.logic_ai.policy_net.load_state_dict(torch.load(model_path))
+            self.logic_ai.policy_net.eval() # ⚠️ CRITICO: Disattiva il dropout e blocca i gradienti per giocare
+            print("✅ [NEURO-SYMBOLIC] Pesi del Meta-Controller caricati con successo!")
+        else:
+            print("⚠️ [NEURO-SYMBOLIC] Modello .pth non trovato. La rete balbetterà logica a caso (Tabula Rasa).")
 
     def update_ui_layout(self):
         cx, cy = self.width // 2, self.height // 2
@@ -158,13 +201,23 @@ class GameGUI:
         self.waiting_for_ai = False  # Reset flag asincrono
         self.arrow_manager.arrows.clear()
 
-        self.horizon_tree = build_horizon_tree(
-            self.state, 
-            self.user_predictor, 
-            max_depth=2, 
-            last_p_act=self.last_executed_p_action, 
-            last_n_act=self.last_executed_n_action
-        )
+        if self.selected_ai == "Pure Logic":
+            self.active_logic_ai = self.pure_logic_ai
+            self.active_logic_ai.evaluate_post_turn(self.state, None, None)
+        elif self.selected_ai == "Neuro-Symbolic":
+            self.active_logic_ai = self.neuro_symbolic_ai
+            
+            # Caricamento dinamico del cervello specializzato!
+            model_path = f"neuro_symbolic_{self.selected_npc_class.lower()}.pth"
+            if os.path.exists(model_path):
+                self.active_logic_ai.policy_net.load_state_dict(torch.load(model_path))
+                self.active_logic_ai.policy_net.eval()
+                print(f"✅ [NEURO-SYMBOLIC] Pesi specializzati per {self.selected_npc_class} caricati!")
+            else:
+                print(f"⚠️ [NEURO-SYMBOLIC] Modello {model_path} non trovato. Tabula rasa.")
+                
+            self.active_logic_ai.evaluate_post_turn(self.state, None, None)
+        
         
         self.player_animator = build_animator(self.selected_player_class, scale=3.0, facing_right=True)
         self.npc_animator = build_animator(self.selected_npc_class, scale=3.0, facing_right=False)
@@ -203,11 +256,10 @@ class GameGUI:
             npc_action = self.bt_ai.decide_action(self.state, npc_role="npc")
             self.finalize_turn(npc_action)
             
-        elif self.selected_ai == "Pure Logic":
+        elif self.selected_ai in ["Pure Logic", "Neuro-Symbolic"]: # Entrambe usano l'interfaccia asincrona
             self.state.npc.char_class = self.selected_npc_class
-            npc_action = self.logic_ai.decide_action(self.state, last_player_action=self.last_executed_p_action, last_npc_action=self.last_executed_n_action)
+            npc_action = self.active_logic_ai.decide_action(self.state, last_player_action=self.last_executed_p_action, last_npc_action=self.last_executed_n_action)
             
-            # Se la cache fa miss, l'IA avvia il thread e restituisce THINKING
             if npc_action == "THINKING":
                 self.waiting_for_ai = True
             else:
@@ -228,19 +280,8 @@ class GameGUI:
         self.last_result = self.state.apply_action_resolution(self.player_action, npc_action)
         
         # Sposta la selezione su un'azione sicura se la corrente è appena andata in cooldown
-        valid_actions = [a for a, d in self.get_active_buttons().items() if not d["disabled"]]
-        if self.player_action not in valid_actions and valid_actions:
-            self.player_action = valid_actions[0]
-
-        self.horizon_tree = build_horizon_tree(
-            self.state, 
-            self.user_predictor, 
-            max_depth=2, 
-            last_p_act=self.last_executed_p_action, 
-            last_n_act=self.last_executed_n_action
-        )
         
-        p_state = ANIM_STATE_MAP.get(self.player_action, "idle")
+        p_state = ANIM_STATE_MAP.get(self.last_executed_p_action, "idle")
         n_state = ANIM_STATE_MAP.get(npc_action, "idle")
         p_delay, n_delay = 0, 0
         self.break_timer = {"player": 0, "npc": 0}
@@ -325,7 +366,14 @@ class GameGUI:
 
         if self.player_action not in self.get_active_buttons():
             self.player_action = Action.ATTACK
-
+            
+        valid_actions = [a for a, d in self.get_active_buttons().items() if not d["disabled"]]
+        if valid_actions and self.player_action not in valid_actions:
+            self.player_action = valid_actions[0]
+        
+        if self.selected_ai in ["Pure Logic", "Neuro-Symbolic"]:
+            self.active_logic_ai.evaluate_post_turn(self.state, self.last_executed_p_action, self.last_executed_n_action)
+        
     def get_active_buttons(self):
         buttons = {}
         p1 = self.state.player
@@ -554,20 +602,34 @@ class GameGUI:
             
             cx, cy = self.width // 2, self.height // 2
             banner_rect = pygame.Rect(cx - 250, cy - 150, 500, 300)
-            is_player_win = self.state.winner() == "Player"
             
-            border_color = (220, 180, 40) if is_player_win else (150, 40, 40)
+            if self.state.winner() == "Player":
+                border_color = (220, 180, 40)
+                win_text = "VICTORY"
+                win_color = (255, 215, 0)
+                survivor_hp = self.state.player.hp
+            elif self.state.winner() == "NPC":
+                border_color = (150, 40, 40)
+                win_text = "DEFEAT"
+                win_color = (220, 80, 80)
+                survivor_hp = self.state.npc.hp
+            else:
+                border_color = (100, 100, 100)
+                win_text = "DRAW"
+                win_color = (180, 180, 180)
+                survivor_hp = 0
+            
             pygame.draw.rect(self.screen, (25, 28, 35), banner_rect, border_radius=12)
             pygame.draw.rect(self.screen, border_color, banner_rect, width=3, border_radius=12)
             
-            win_text = "VICTORY" if is_player_win else "DEFEAT"
-            win_color = (255, 215, 0) if is_player_win else (220, 80, 80)
             msg = self.font_main.render(win_text, True, win_color)
             self.screen.blit(msg, msg.get_rect(center=(cx, cy - 70)))
             
-            survivor_hp = self.state.player.hp if is_player_win else self.state.npc.hp
             turns = self.last_result['turn'] if self.last_result else 0
-            stats_msg = self.font_sub.render(f"HP Rimanenti: {survivor_hp}  |  Turni Giocati: {turns}", True, (180, 190, 200))
+            if survivor_hp != 0:
+                stats_msg = self.font_sub.render(f"HP Rimanenti: {survivor_hp}  |  Turni Giocati: {turns}", True, (180, 190, 200))
+            else:
+                stats_msg = self.font_sub.render(f"Turni Giocati: {turns}", True, (180, 190, 200))
             self.screen.blit(stats_msg, stats_msg.get_rect(center=(cx, cy + 10)))
             
             draw_button(self.screen, self.font_sub, self.victory_button, "Return to Menu", fill=(40, 100, 180))
@@ -594,9 +656,9 @@ class GameGUI:
         inspect_btn = pygame.Rect(self.width - 200, self.height - 50, 180, 36)
         draw_button(self.screen, self.font_small, inspect_btn, "Inspect Tree [T]", fill=(45, 60, 85))
 
-        if self.show_tree_overlay and self.horizon_tree:
+        if self.show_tree_overlay and self.selected_ai == "Pure Logic" and self.active_logic_ai.horizon_tree:
             self.tree_viewer.draw(
-                self.screen, self.horizon_tree,
+                self.screen, self.active_logic_ai.horizon_tree,
                 self.font_sub, self.font_small,
                 self.width, self.height
             )
@@ -679,7 +741,7 @@ class GameGUI:
                 
                 # LOOP DI CONTROLLO ASINCRONO: interroga l'IA ogni frame se stiamo aspettando
                 if self.waiting_for_ai:
-                    npc_action = self.logic_ai.decide_action(self.state, last_player_action=self.player_action)
+                    npc_action = self.active_logic_ai.decide_action(self.state, last_player_action=self.player_action)
                     if npc_action != "THINKING":
                         self.waiting_for_ai = False
                         self.finalize_turn(npc_action)
