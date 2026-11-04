@@ -46,7 +46,7 @@ class MetaControllerLSTM(nn.Module):
 
 
 class NeuroSymbolicAI:
-    def __init__(self, vitamin_client, user_predictor, vocab, masker, state_dim=8):
+    def __init__(self, vitamin_client, user_predictor, vocab, masker, state_dim=14):
         self.vitamin = vitamin_client
         self.user_predictor = user_predictor
         self.vocab = vocab
@@ -63,17 +63,23 @@ class NeuroSymbolicAI:
         # Variabili di stato per il PPO
         self.last_log_probs = []
         self.last_formula = None
-        self.last_state_value = None # <--- Nuovo contenitore per il calcolo dell'Advantage
+        self.last_state_value = None
         
         self.is_thinking = False
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="NeuroSym_Worker")
 
 
     def _get_state_tensor(self, game_state):
-
         sig = get_state_signature(game_state, 0)
-        tensor = torch.tensor(list(sig[1:]), dtype=torch.float32)
-        return (tensor / 3.0).unsqueeze(0)
+        scales = torch.tensor([7.0, 3.0, 1.0, 1.0, 7.0, 3.0, 1.0, 1.0], dtype=torch.float32)
+        base_features = torch.tensor(list(sig[1:]), dtype=torch.float32) / scales
+        
+        classes = ["Warrior", "Mage", "Ranger"]
+        p_onehot = [1.0 if game_state.player.char_class == c else 0.0 for c in classes]
+        n_onehot = [1.0 if game_state.npc.char_class == c else 0.0 for c in classes]
+        
+        class_features = torch.tensor(p_onehot + n_onehot, dtype=torch.float32)
+        return torch.cat((base_features, class_features), dim=0).unsqueeze(0)
 
 
     def _generate_formula(self, game_state):
@@ -82,8 +88,6 @@ class NeuroSymbolicAI:
         saved_log_probs = []
         
         state_tensor = self._get_state_tensor(game_state)
-        
-        # Calcolo istantaneo del Valore di Stato tramite il Critic
         state_value = self.policy_net.evaluate_state(state_tensor)
         
         hidden = self.policy_net.init_hidden()
@@ -125,24 +129,37 @@ class NeuroSymbolicAI:
 
 
     def _evaluate_transition(self, current_state, next_state):
-
         damage_dealt = current_state.player.hp - next_state.player.hp
         damage_taken = current_state.npc.hp - next_state.npc.hp
         sp_gained = next_state.npc.sp - current_state.npc.sp
+        form = self.last_formula or ""
 
-        score = (damage_dealt * 5.0) + (sp_gained * 1.5) - (damage_taken * 3.0)
+        has_off = any(p in form for p in ["Dead_P", "LowHP_P", "HP_Advantage_N"])
+        has_spec = "SpecialReady_N" in form
 
-        if current_state.npc.sp >= current_state.npc.stats["sp_threshold"] and next_state.npc.sp < current_state.npc.sp:
-            score += 50.0  
-   
-        if next_state.player.hp <= 0:
-            score += 1000.0  
+        if has_off:
+            # Piano offensivo: massimizza i danni e l'uso della Special
+            score = (damage_dealt * 6.0) + (sp_gained * 2.0) - (damage_taken * 2.0)
+            if current_state.npc.sp >= current_state.npc.stats["sp_threshold"] and next_state.npc.sp < current_state.npc.sp:
+                score += 60.0
+            if next_state.player.hp <= 0:
+                score += 1000.0
+        elif has_spec:
+            # Piano di preparazione: massimizza SP e attivazione Buff
+            score = (sp_gained * 8.0) + (damage_dealt * 2.0) - (damage_taken * 3.0)
+            if (next_state.npc.def_buff_turns > current_state.npc.def_buff_turns or 
+                next_state.npc.atk_buff_turns > current_state.npc.atk_buff_turns):
+                score += 25.0
+        else:
+            # Piano puramente difensivo (es. sola Alive_N): pensa solo a non prendere danni (DEFEND/BUFF)
+            score = -(damage_taken * 8.0) + (sp_gained * 1.0)
+            if next_state.npc.def_buff_turns > current_state.npc.def_buff_turns:
+                score += 15.0
 
         return score
 
 
     def _extract_plan_from_trace(self, response, root_node, nodes_list):
-
         plan = []
         valid_state_names = response.get("verification", {}).get("satisfying_states", [])
 
@@ -150,7 +167,6 @@ class NeuroSymbolicAI:
             return plan
            
         safe_nodes = set()
-
         for name in valid_state_names:
             try:
                 idx = int(name.replace("s", ""))
@@ -163,11 +179,12 @@ class NeuroSymbolicAI:
         while current.transitions:
             action_evals = {}
             for p_act, n_act, prob, child in current.transitions:
-
                 if n_act not in action_evals:
                     action_evals[n_act] = {
                         'expected_utility': 0.0,
-                        'max_p_prob': -1.0,
+                        'safe_prob': 0.0,
+                        'max_safe_p_prob': -1.0,
+                        'best_safe_score': -float('inf'),
                         'best_p_act_for_logs': None,
                         'target_node': None
                     }
@@ -175,37 +192,46 @@ class NeuroSymbolicAI:
                 score = self._evaluate_transition(current.state, child.state)
                 action_evals[n_act]['expected_utility'] += prob * score
 
-                if prob > action_evals[n_act]['max_p_prob']:
-                    action_evals[n_act]['max_p_prob'] = prob
-                    action_evals[n_act]['best_p_act_for_logs'] = p_act
-                    action_evals[n_act]['target_node'] = child
+                # FIX CRITICO: Consideriamo come target_node SOLO i figli che soddisfano la formula CTL (in safe_nodes)!
+                if child in safe_nodes:
+                    action_evals[n_act]['safe_prob'] += prob
+                    if (prob > action_evals[n_act]['max_safe_p_prob'] or 
+                       (abs(prob - action_evals[n_act]['max_safe_p_prob']) < 1e-6 and score > action_evals[n_act]['best_safe_score'])):
+                        action_evals[n_act]['max_safe_p_prob'] = prob
+                        action_evals[n_act]['best_safe_score'] = score
+                        action_evals[n_act]['best_p_act_for_logs'] = p_act
+                        action_evals[n_act]['target_node'] = child
 
             best_n_act = None
-            best_ev = -float('inf')
+            best_combined_score = -float('inf')
             best_data = None
 
             for n_act, data in action_evals.items():
-                if data['target_node'] in safe_nodes and data['expected_utility'] > best_ev:
-                    best_ev = data['expected_utility']
-                    best_n_act = n_act
-                    best_data = data
+                if data['target_node'] is not None and data['safe_prob'] > 0.0:
+                    # Premiamo l'azione che massimizza sia la probabilità di soddisfare la formula CTL
+                    # attraverso le risposte nemiche, sia l'utilità tattica di combattimento
+                    combined = (data['safe_prob'] * 25.0) + data['expected_utility']
+                    if combined > best_combined_score:
+                        best_combined_score = combined
+                        best_n_act = n_act
+                        best_data = data
 
-            if best_n_act and best_data:
+            if best_n_act is not None and best_data is not None:
                 plan.append({
                     "npc_action": best_n_act,
                     "expected_player_action": best_data['best_p_act_for_logs'],
-                    "probability": best_data['max_p_prob'],
+                    "probability": best_data['safe_prob'],
                     "expected_signature": get_state_signature(best_data['target_node'].state, best_data['target_node'].depth),
                     "expected_props": list(best_data['target_node'].atomic_props)
                 })
                 current = best_data['target_node']
             else:
                 break
+                
         return plan
 
 
     def _async_compute(self, game_state, last_p_act, last_n_act):
-        # Estraiamo anche lo state_value e lo salviamo nella classe
         generated_formula, saved_log_probs, state_value = self._generate_formula(game_state)
         
         self.last_log_probs = saved_log_probs
@@ -231,7 +257,6 @@ class NeuroSymbolicAI:
         model_text = generate_vitamin_model(self.horizon_tree)
         nodes = []
 
-
         def collect_nodes(node):
             if node not in nodes:
                 nodes.append(node)
@@ -241,7 +266,6 @@ class NeuroSymbolicAI:
         collect_nodes(self.horizon_tree)
 
         is_satisfied, response = self.vitamin.verify_formula(model_text, generated_formula, generate_trace=True)
-
 
         if is_satisfied:
             safe_states = response.get("verification", {}).get("satisfying_states", [])
@@ -262,7 +286,6 @@ class NeuroSymbolicAI:
 
 
     def evaluate_post_turn(self, game_state, last_player_action, last_npc_action):
-       
         if self.is_thinking:
             return
         
@@ -278,9 +301,7 @@ class NeuroSymbolicAI:
             self.executor.submit(self._async_compute, game_state, last_player_action, last_npc_action)
 
 
-
     def decide_action(self, game_state, last_player_action=None, last_npc_action=None):
-
         if self.is_thinking:
             return "THINKING"
 
@@ -301,12 +322,8 @@ class NeuroSymbolicAI:
 
 class DummyAI:
     """
-    Fase 1: Sacco da boxe. 
-    Non fa danni, carica solo la speciale o si buffa. 
-    Insegna all'agente che la tartaruga porta allo stallo e bisogna attaccare per vincere.
+    Fase 1: Avversario base per il Curriculum Learning.
     """
-    def decide_action(self,game_state, npc_role="player"):
-        
+    def decide_action(self, game_state, npc_role="player"):
         action = Action.BUFF if game_state.is_buff_allowed(game_state.player) else Action.ATTACK
-        # Assumendo che esista Action.CHARGE o similare nel tuo enum Action
-        return action if r.randint(1,100) > 50 else Action.DEFEND
+        return action if r.randint(1, 100) > 50 else Action.DEFEND

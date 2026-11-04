@@ -1,26 +1,29 @@
 import copy
 from pyFighters import Action, LogicFightersState
 
-# --- UTILITIES DI ASTRAZIONE ---
+# --- UTILITIES DI ASTRAZIONE CALIBRATE SUI DANNI REALI (Warrior 70 HP, Base 5, Buffed 3) ---
 def discretize_hp(hp, max_hp):
     if hp <= 0:
         return 0  # MORTO
     
-    ratio = hp / max_hp
-    if ratio <= 0.30:
-        return 1  # CRITICO 
-    elif ratio <= 0.70:
-        return 2  # MEDIO
-    else:
-        return 3  # ALTO
+    ratio = hp / max_hp if max_hp > 0 else 0.0
+    if ratio <= 0.15: return 1
+    if ratio <= 0.30: return 2  # Soglia critica LowHP
+    if ratio <= 0.45: return 3
+    if ratio <= 0.60: return 4
+    if ratio <= 0.75: return 5
+    if ratio <= 0.90: return 6
+    return 7                    # Quasi intatto (64-70 HP)
 
 def discretize_special(special, max_sp):
     if special >= max_sp:
-        return 2  # PRONTO 
+        return 3  # PRONTO (6/6 SP)
+    elif special >= max_sp - 2:
+        return 2  # A UN PASSO DALLA SPECIALE (4/6 SP)
     elif special > 0:
-        return 1  # IN CARICA
+        return 1  # INIZIO CARICA (2/6 SP)
     else:
-        return 0  # VUOTO
+        return 0  # VUOTO (0/6 SP)
 
 
 class UserPredictor:
@@ -60,31 +63,55 @@ class UserPredictor:
 
 
 class StateTreeNode:
-    def __init__(self, state_snapshot, depth=0, parent_prob=1.0):
+    def __init__(self, state_snapshot, depth=0, parent_prob=1.0, root_state=None):
         self.state = state_snapshot
         self.depth = depth
         self.prob = parent_prob
+        self.root_state = root_state if root_state is not None else state_snapshot
         self.transitions = []
         self.atomic_props = self._evaluate_atomic_props()
 
     def _evaluate_atomic_props(self):
         p, n = self.state.player, self.state.npc
+        rp, rn = self.root_state.player, self.root_state.npc
         props = set()
         
-        # Le proposizioni ora possono usare direttamente le stesse regole di discretizzazione per coerenza
-        if p.hp <= 0: props.add("Dead_P")
-        if n.hp <= 0: props.add("Dead_N")
-        if n.hp > 0: props.add("Alive_N") 
-        if discretize_hp(p.hp, p.stats["max_hp"]) == 1: props.add("LowHP_P")
-        if discretize_hp(n.hp, n.stats["max_hp"]) == 1: props.add("LowHP_N")
+        dmg_dealt = rp.hp - p.hp
         
-        if n.hp > p.hp: props.add("HP_Advantage_N")
+        # 1. Sopravvivenza e Letalità (Dead_P si attiva sul KO o su danno pesante a nemico ferito)
+        if p.hp <= 0 or (self.depth > 0 and p.hp <= p.stats["max_hp"] * 0.40 and dmg_dealt >= 5):
+            props.add("Dead_P")
+        if n.hp <= 0:
+            props.add("Dead_N")
+        if n.hp > 0:
+            props.add("Alive_N") 
         
+        # 2. LowHP_P: Vera se il Player è <= 30% HP OPPURE se nel ramo gli abbiamo inflitto
+        # almeno 3 danni (1 ATTACK contro Warrior buffato fa esattamente 5 - 2 = 3 danni; DEFEND e BUFF fanno 0!)
+        if discretize_hp(p.hp, p.stats["max_hp"]) <= 2 or (self.depth > 0 and dmg_dealt >= 3):
+            props.add("LowHP_P")
+            
+        if discretize_hp(n.hp, n.stats["max_hp"]) <= 2:
+            props.add("LowHP_N")
+        
+        # 3. HP_Advantage_N: Vera se l'NPC è in vantaggio di HP o migliora/mantiene il differenziale attaccando
+        if self.depth == 0:
+            if n.hp > p.hp:
+                props.add("HP_Advantage_N")
+        else:
+            if n.hp > p.hp or ((n.hp - p.hp) >= (rn.hp - rp.hp) and dmg_dealt >= 3):
+                props.add("HP_Advantage_N")
+        
+        # 4. SpecialReady_N: Vera se gli SP sono al massimo OPPURE se nel ramo abbiamo caricato SP / attivato Buff
         if p.sp >= p.stats["sp_threshold"]: props.add("SpecialReady_P")
         elif p.sp >= p.stats["sp_threshold"] - 2: props.add("SpecialDanger_P")
         
-        if n.sp >= n.stats["sp_threshold"]: props.add("SpecialReady_N")
-        elif n.sp >= n.stats["sp_threshold"] - 2: props.add("SpecialDanger_N")
+        sp_gained = n.sp > rn.sp
+        buff_gained = (n.def_buff_turns > rn.def_buff_turns) or (n.atk_buff_turns > rn.atk_buff_turns)
+        if n.sp >= n.stats["sp_threshold"] or (self.depth > 0 and (sp_gained or buff_gained)):
+            props.add("SpecialReady_N")
+        elif n.sp >= n.stats["sp_threshold"] - 2:
+            props.add("SpecialDanger_N")
         
         if p.def_buff_turns > 0: props.add("DefBuff_P")
         if p.atk_buff_turns > 0: props.add("AtkBuff_P")
@@ -104,56 +131,42 @@ def clone_state(base_state):
     new_s.npc = copy.deepcopy(base_state.npc)
     return new_s
 
-def get_state_signature(state, current_depth):
-    """
-    Comprime lo stato in una firma a bassa cardinalità per massimizzare
-    i cache hit (Match) ed evitare lo State Space Explosion, 
-    mantenendo 4 fasce di salute per preservare i dettagli tattici.
-    """
-    def abstract_hp(hp, max_hp):
-        ratio = hp / max_hp if max_hp > 0 else 0
-        if ratio > 0.75: return 3  # Ottima salute
-        if ratio > 0.50: return 2  # Buona salute
-        if ratio > 0.25: return 1  # Ferito / Attenzione
-        return 0                   # Critico
 
-    def abstract_sp(sp, threshold):
-        if sp >= threshold: return 2 # Special Pronta
-        if sp > 0: return 1          # In Carica
-        return 0                     # Vuoto
-
-    p1, p2 = state.player, state.npc
+def get_state_signature(state, current_depth=0):
+    s = state.state if hasattr(state, "state") else state
+    p1, p2 = s.player, s.npc
     
     return (
         current_depth,
-        
-        # Astrazione Player
-        abstract_hp(p1.hp, p1.stats["max_hp"]),
-        abstract_sp(p1.sp, p1.stats["sp_threshold"]),
+        discretize_hp(p1.hp, p1.stats["max_hp"]),
+        discretize_special(p1.sp, p1.stats["sp_threshold"]),
         1 if p1.atk_buff_turns > 0 else 0,
         1 if p1.def_buff_turns > 0 else 0,
-        
-        # Astrazione NPC
-        abstract_hp(p2.hp, p2.stats["max_hp"]),
-        abstract_sp(p2.sp, p2.stats["sp_threshold"]),
+        discretize_hp(p2.hp, p2.stats["max_hp"]),
+        discretize_special(p2.sp, p2.stats["sp_threshold"]),
         1 if p2.atk_buff_turns > 0 else 0,
         1 if p2.def_buff_turns > 0 else 0
     )
 
-def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, current_prob=1.0, prune_threshold=0.15, memo=None, use_dag=True, last_p_act=None, last_n_act=None):
+
+def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, current_prob=1.0, prune_threshold=0.15, memo=None, use_dag=True, last_p_act=None, last_n_act=None, root_state=None):
+    if root_state is None:
+        root_state = current_state
+        
     if use_dag and memo is None:
         memo = {}
         
-    if use_dag:
-        signature = get_state_signature(current_state, cur_depth)
-        memo_key = (signature, last_p_act, last_n_act)
-        
-        if memo_key in memo:
-            return memo[memo_key]
-            
-    node = StateTreeNode(current_state, depth=cur_depth, parent_prob=current_prob)
+    COOLDOWN_ACTIONS = [Action.COUNTER]
+    p_cd_locked = (last_p_act in COOLDOWN_ACTIONS)
+    n_cd_locked = (last_n_act in COOLDOWN_ACTIONS)
+    
+    node = StateTreeNode(current_state, depth=cur_depth, parent_prob=current_prob, root_state=root_state)
     
     if use_dag:
+        signature = get_state_signature(current_state, cur_depth)
+        memo_key = (signature, p_cd_locked, n_cd_locked, frozenset(node.atomic_props))
+        if memo_key in memo:
+            return memo[memo_key]
         memo[memo_key] = node
         
     if cur_depth >= max_depth or current_state.is_finished():
@@ -161,56 +174,47 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
 
     p_dist = user_predictor.get_distribution(current_state.player)
     
-    # --- 1. APPLICAZIONE REGOLE E NORMALIZZAZIONE PLAYER ---
-    COOLDOWN_ACTIONS = [Action.COUNTER]
     adjusted_p_dist = {}
-    
-    # Check Buff Player: Il buff dura finché "def_buff_turns" > 0 (adatta al nome della tua variabile)
-    # Assumo che esista un attributo simile a 'def_buff_turns' basandomi sulla tua logica
-    p_has_buff = current_state.player.def_buff_turns > 0 or current_state.player.atk_buff_turns > 0
+    p_has_buff = (not current_state.is_buff_allowed(current_state.player)) or (
+        current_state.player.char_class == "Mage" and current_state.player.sp >= current_state.player.stats["sp_threshold"]
+    )
     
     for a_p, prob in p_dist.items():
-        if last_p_act in COOLDOWN_ACTIONS and a_p == last_p_act:
+        if p_cd_locked and a_p == last_p_act:
             continue
-            
         if p_has_buff and a_p == Action.BUFF:
             continue
-            
         if a_p == last_p_act:
             prob *= 0.70 
             
         adjusted_p_dist[a_p] = adjusted_p_dist.get(a_p, 0.0) + prob
         
-    # Regola A (Migliorata): Trasferimento e Boost per la Special
     if current_state.player.sp >= current_state.player.stats["sp_threshold"]:
         attack_prob = adjusted_p_dist.pop(Action.ATTACK, 0.0)
         special_prob = adjusted_p_dist.get(Action.SPECIAL, 0.0)
-        
-        # Uniamo i valori e diamo un bonus psicologico del 50% alla voglia di usare la special
-        boosted_special = (attack_prob + special_prob) * 1.5 
-        adjusted_p_dist[Action.SPECIAL] = boosted_special
+        adjusted_p_dist[Action.SPECIAL] = (attack_prob + special_prob) * 1.5
 
-    # Normalizzazione finale Player
     total_prob = sum(adjusted_p_dist.values())
     if total_prob > 0:
         adjusted_p_dist = {k: v / total_prob for k, v in adjusted_p_dist.items()}
 
-    # --- 2. APPLICAZIONE REGOLE NPC ---
-    npc_actions = [Action.DEFEND, Action.COUNTER, Action.BUFF]
+    npc_actions = []
     if current_state.npc.sp >= current_state.npc.stats["sp_threshold"]:
         npc_actions.append(Action.SPECIAL)
     else:
         npc_actions.append(Action.ATTACK)
+    npc_actions.extend([Action.COUNTER, Action.BUFF, Action.DEFEND])
         
-    if last_n_act in COOLDOWN_ACTIONS and last_n_act in npc_actions:
+    if n_cd_locked and last_n_act in npc_actions:
         npc_actions.remove(last_n_act)
-        
-    # Check Buff NPC
-    n_has_buff = current_state.npc.def_buff_turns > 0 or current_state.npc.atk_buff_turns > 0
-    if n_has_buff and Action.BUFF in npc_actions:
+
+    n_buff_useless = (not current_state.is_buff_allowed(current_state.npc)) or (
+                current_state.npc.char_class == "Mage" and current_state.npc.sp >= current_state.npc.stats["sp_threshold"]
+            )
+    
+    if (n_buff_useless or not current_state.is_buff_allowed(current_state.npc)) and Action.BUFF in npc_actions:
         npc_actions.remove(Action.BUFF)
             
-    # --- 3. CREAZIONE RAMI ---
     for a_p, prob_p in adjusted_p_dist.items():
         if prob_p < prune_threshold:
             continue
@@ -229,12 +233,15 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
                 prune_threshold=prune_threshold,
                 memo=memo,
                 use_dag=use_dag,
-                last_p_act=a_p,  # Propaga la mossa del nodo corrente al livello successivo
-                last_n_act=a_n
+                last_p_act=a_p,
+                last_n_act=a_n,
+                root_state=root_state
             )
             node.transitions.append((a_p, a_n, prob_p, child_node))
 
     return node
+
+
 def generate_vitamin_model(root_node):
     nodes = []
     def collect_nodes(node):
@@ -263,14 +270,13 @@ def generate_vitamin_model(root_node):
     matrix = [["0" for _ in nodes] for _ in nodes]
     for i, node in enumerate(nodes):
         if not node.transitions:
-            matrix[i][i] = "1" # Anche il loop deve essere 1, non la stringa "loop"
+            matrix[i][i] = "1"
         else:
             for ap_action, npc_action, _, child in node.transitions:
                 j = nodes.index(child)
-                matrix[i][j] = "1" # CRITICO: Solo "1", nessuna etichetta stringa!
+                matrix[i][j] = "1"
 
     lines = []
-    
     lines.append("Transition")
     for row in matrix:
         lines.append(" ".join(row))
@@ -296,6 +302,7 @@ def generate_vitamin_model(root_node):
     
     return "\n".join(lines)
 
+
 def parse_vitamin_trace(response_json, root_node):
     verification = response_json.get("verification", {})
     trace_states = verification.get("satisfying_states", [])
@@ -320,15 +327,20 @@ def parse_vitamin_trace(response_json, root_node):
         except (ValueError, IndexError):
             continue
 
+    root_diff = root_node.state.npc.hp - root_node.state.player.hp
     action_scores = {}
+    
     for p_act, n_act, prob, child in root_node.transitions:
         if n_act not in action_scores:
             action_scores[n_act] = 0.0
         
         if child in safe_nodes:
-            action_scores[n_act] += prob
+            child_diff = child.state.npc.hp - child.state.player.hp
+            dmg_dealt = root_node.state.player.hp - child.state.player.hp
+            progress_bonus = 0.002 * dmg_dealt + 0.001 * (child_diff - root_diff)
+            action_scores[n_act] += prob * (1.0 + progress_bonus)
 
-    if not action_scores:
+    if not action_scores or max(action_scores.values()) <= 0.0:
         return Action.DEFEND, set()
         
     best_action = max(action_scores.items(), key=lambda x: x[1])[0]

@@ -17,7 +17,8 @@ class CTLVocabulary:
 class GrammarMasker:
     """
     FSM rigorosa per CTL senza tautologie né ridondanze sintattiche.
-    Genera solo formule canoniche: [E/A] [F/G] Prop1 ([and/or] Prop2) <EOS>
+    - 'A G Alive_N' / 'E G Alive_N': Invariante di sopravvivenza (vero in s0).
+    - 'E F <Goal>': Raggiungibilità esistenziale di un obiettivo tattico in depth >= 1.
     """
     def __init__(self, vocab: CTLVocabulary):
         self.vocab = vocab
@@ -25,6 +26,7 @@ class GrammarMasker:
         
     def reset(self):
         self.mode = 'START'
+        self.quantifier = None
         self.last_token = None
         self.temp_op = None
         self.bool_count = 0
@@ -45,30 +47,31 @@ class GrammarMasker:
             allowed = ['E', 'A']
             
         elif self.mode == 'TEMP_OP':
-            allowed = ['F', 'G']
+            # Su Kripke a 1 agente, 'A F' è sempre falsificata dal ramo passivo DEFEND dell'NPC
+            if self.quantifier == 'A':
+                allowed = ['G']
+            else:
+                allowed = ['F', 'G']
             
         elif self.mode == 'FORMULA':
             if self.last_token in ['F', 'G', 'and', 'or']:
-                # Niente ripetizioni della stessa proposizione
                 allowed = [p for p in self.vocab.propositions if p not in self.used_props]
                 
-                # REGOLA SEMANTICA DI 'G' (Invariante):
-                # 'G phi' richiede che phi sia GIA' vera nello stato corrente.
-                # Dead_P, LowHP_P, SpecialReady_N e Horizon sono quasi sempre falsi a inizio match:
-                # usarli come radice di 'G' causa il 90% delle Sconfitte Tecniche a Turno 1.
-                if self.temp_op == 'G' and self.bool_count == 0:
-                    allowed = [p for p in allowed if p in ['Alive_N', 'HP_Advantage_N']]
-                elif self.temp_op == 'G' and 'Horizon' in allowed:
-                    allowed.remove('Horizon')
+                if self.temp_op == 'G':
+                    # Solo Alive_N è garantita vera in s0 anche a parità o svantaggio di HP
+                    allowed = [p for p in allowed if p == 'Alive_N']
+                elif self.temp_op == 'F' and self.bool_count == 0:
+                    allowed = [p for p in allowed if p != 'Alive_N']
                 
                 if self.last_bool_op == 'or' and 'Horizon' in allowed:
                     allowed.remove('Horizon')
-                
                 if self.last_bool_op == 'or' and 'Alive_N' in allowed:
                     allowed.remove('Alive_N')
 
             elif self.last_token in self.vocab.propositions:
-                if self.last_token == 'Horizon' and self.bool_count < 1:
+                if self.temp_op == 'G':
+                    allowed = ['<EOS>']
+                elif self.last_token == 'Horizon' and self.bool_count < 1:
                     allowed = ['and']
                 else:
                     if self.bool_count < 1:
@@ -89,6 +92,7 @@ class GrammarMasker:
         token = self.vocab.id2token[token_id]
         
         if self.mode == 'START':
+            self.quantifier = token
             self.mode = 'TEMP_OP'
         elif self.mode == 'TEMP_OP':
             self.temp_op = token
