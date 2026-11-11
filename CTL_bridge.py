@@ -1,7 +1,6 @@
 import copy
 from pyFighters import Action, LogicFightersState
 
-# --- UTILITIES DI ASTRAZIONE CALIBRATE SUI DANNI REALI (Warrior 70 HP, Base 5, Buffed 3) ---
 def discretize_hp(hp, max_hp):
     if hp <= 0:
         return 0  # MORTO
@@ -17,13 +16,13 @@ def discretize_hp(hp, max_hp):
 
 def discretize_special(special, max_sp):
     if special >= max_sp:
-        return 3  # PRONTO (6/6 SP)
+        return 3  # PRONTO
     elif special >= max_sp - 2:
-        return 2  # A UN PASSO DALLA SPECIALE (4/6 SP)
+        return 2  # A UN PASSO DALLA SPECIALE
     elif special > 0:
-        return 1  # INIZIO CARICA (2/6 SP)
+        return 1  # INIZIO CARICA
     else:
-        return 0  # VUOTO (0/6 SP)
+        return 0  # VUOTO
 
 
 class UserPredictor:
@@ -76,51 +75,66 @@ class StateTreeNode:
         rp, rn = self.root_state.player, self.root_state.npc
         props = set()
         
+        p_max = p.stats["max_hp"]
+        n_max = n.stats["max_hp"]
         dmg_dealt = rp.hp - p.hp
-        
-        # 1. Sopravvivenza e Letalità (Dead_P si attiva sul KO o su danno pesante a nemico ferito)
-        if p.hp <= 0 or (self.depth > 0 and p.hp <= p.stats["max_hp"] * 0.40 and dmg_dealt >= 5):
+
+        # ===== 1. SOPRAVVIVENZA & LETALITÀ =====
+        if p.hp <= 0:
             props.add("Dead_P")
         if n.hp <= 0:
             props.add("Dead_N")
         if n.hp > 0:
-            props.add("Alive_N") 
-        
-        # 2. LowHP_P: Vera se il Player è <= 30% HP OPPURE se nel ramo gli abbiamo inflitto
-        # almeno 3 danni (1 ATTACK contro Warrior buffato fa esattamente 5 - 2 = 3 danni; DEFEND e BUFF fanno 0!)
-        if discretize_hp(p.hp, p.stats["max_hp"]) <= 2 or (self.depth > 0 and dmg_dealt >= 3):
+            props.add("Alive_N")
+
+        # ===== 2. SOGLIE DI SALUTE E PRESSIONE OFFENSIVA =====
+        # Vera se il Player è <= 30% HP oppure se in questo ramo ha subito un colpo netto (>= 3 HP)
+        if (p.hp > 0 and (p.hp / p_max) <= 0.30) or (self.depth > 0 and dmg_dealt >= 3):
             props.add("LowHP_P")
-            
-        if discretize_hp(n.hp, n.stats["max_hp"]) <= 2:
+        if n.hp > 0 and (n.hp / n_max) <= 0.30:
             props.add("LowHP_N")
-        
-        # 3. HP_Advantage_N: Vera se l'NPC è in vantaggio di HP o migliora/mantiene il differenziale attaccando
+
+        # ===== 3. DIFFERENZIALE HP (Assoluto in s0, o Vantaggio di Scambio nel ramo) =====
         if self.depth == 0:
             if n.hp > p.hp:
                 props.add("HP_Advantage_N")
         else:
-            if n.hp > p.hp or ((n.hp - p.hp) >= (rn.hp - rp.hp) and dmg_dealt >= 3):
+            if n.hp > p.hp or ((n.hp - p.hp) > (rn.hp - rp.hp)):
                 props.add("HP_Advantage_N")
-        
-        # 4. SpecialReady_N: Vera se gli SP sono al massimo OPPURE se nel ramo abbiamo caricato SP / attivato Buff
-        if p.sp >= p.stats["sp_threshold"]: props.add("SpecialReady_P")
-        elif p.sp >= p.stats["sp_threshold"] - 2: props.add("SpecialDanger_P")
-        
-        sp_gained = n.sp > rn.sp
-        buff_gained = (n.def_buff_turns > rn.def_buff_turns) or (n.atk_buff_turns > rn.atk_buff_turns)
-        if n.sp >= n.stats["sp_threshold"] or (self.depth > 0 and (sp_gained or buff_gained)):
+
+        # ===== 4. POTENZIALE DI UCCISIONE (CanKill_N) =====
+        if p.hp > 0:
+            best_raw = n.stats["base_dmg"]
+            if n.atk_buff_turns > 0:
+                best_raw = max(best_raw, n.stats["base_dmg"] + n.stats.get("buff_atk_val", 0))
+            if n.sp >= n.stats["sp_threshold"]:
+                best_raw = max(best_raw, n.stats["special_dmg"])
+            if getattr(n, "counter_cooldown", 0) == 0:
+                best_raw = max(best_raw, n.stats["counter_crit"])
+
+            if best_raw >= p.hp:
+                props.add("CanKill_N")
+
+        # ===== 5. MINACCIA AVVERSARIA (Threat_P) =====
+        if p.sp >= p.stats["sp_threshold"] or p.atk_buff_turns > 0:
+            props.add("Threat_P")
+
+        # ===== 6. BARRA SPECIALE (SpecialReady_N) =====
+        if n.sp >= n.stats["sp_threshold"] or (self.depth > 0 and n.sp > rn.sp):
             props.add("SpecialReady_N")
-        elif n.sp >= n.stats["sp_threshold"] - 2:
-            props.add("SpecialDanger_N")
-        
+
+        # ===== 7. STATO BUFF (Fortified_N) =====
+        if n.def_buff_turns > 0 or n.atk_buff_turns > 0:
+            props.add("Fortified_N")
+
+        # ===== 8. LABELS AUSILIARI & COOLDOWN =====
         if p.def_buff_turns > 0: props.add("DefBuff_P")
         if p.atk_buff_turns > 0: props.add("AtkBuff_P")
         if n.def_buff_turns > 0: props.add("DefBuff_N")
         if n.atk_buff_turns > 0: props.add("AtkBuff_N")
-        
-        if getattr(p, "counter_cooldown", 0) == 0: props.add("CounterReady_P")
         if getattr(n, "counter_cooldown", 0) == 0: props.add("CounterReady_N")
-        
+        if getattr(p, "counter_cooldown", 0) == 0: props.add("CounterReady_P")
+
         return props
 
 
@@ -209,10 +223,10 @@ def build_horizon_tree(current_state, user_predictor, max_depth=3, cur_depth=0, 
         npc_actions.remove(last_n_act)
 
     n_buff_useless = (not current_state.is_buff_allowed(current_state.npc)) or (
-                current_state.npc.char_class == "Mage" and current_state.npc.sp >= current_state.npc.stats["sp_threshold"]
-            )
+        current_state.npc.char_class == "Mage" and current_state.npc.sp >= current_state.npc.stats["sp_threshold"]
+    )
     
-    if (n_buff_useless or not current_state.is_buff_allowed(current_state.npc)) and Action.BUFF in npc_actions:
+    if n_buff_useless and Action.BUFF in npc_actions:
         npc_actions.remove(Action.BUFF)
             
     for a_p, prob_p in adjusted_p_dist.items():

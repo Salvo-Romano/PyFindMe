@@ -1,7 +1,5 @@
 class CTLVocabulary:
     def __init__(self, atomic_propositions):
-        # Rimossi '(' e ')' perché con max 1 operatore booleano creano solo 
-        # duplicati sintattici inutili come "E F ( Alive_N )"
         self.operators = ['E', 'A', 'F', 'G', 'and', 'or']
         self.propositions = atomic_propositions
         self.eos_token = '<EOS>'
@@ -16,12 +14,21 @@ class CTLVocabulary:
 
 class GrammarMasker:
     """
-    FSM rigorosa per CTL senza tautologie né ridondanze sintattiche.
-    - 'A G Alive_N' / 'E G Alive_N': Invariante di sopravvivenza (vero in s0).
-    - 'E F <Goal>': Raggiungibilità esistenziale di un obiettivo tattico in depth >= 1.
+    FSM rigorosa per CTL senza Alive_N.
+    - A G / E G: mantenimento di invarianti tattici (HP_Advantage_N, Fortified_N, CounterReady_N)
+    - E F: sintesi verso obiettivi primari (Dead_P, CanKill_N, LowHP_P, HP_Advantage_N, SpecialReady_N, Fortified_N)
     """
     def __init__(self, vocab: CTLVocabulary):
         self.vocab = vocab
+        
+        self.primary_goals = [
+            'Dead_P', 'CanKill_N', 'LowHP_P', 
+            'HP_Advantage_N', 'SpecialReady_N', 'Fortified_N'
+        ]
+        self.invariants = ['HP_Advantage_N', 'Fortified_N', 'CounterReady_N']
+        self.qualifiers = ['Threat_P', 'CounterReady_N', 'Fortified_N']
+        self.force_and = ['Horizon']
+        
         self.reset()
         
     def reset(self):
@@ -47,7 +54,6 @@ class GrammarMasker:
             allowed = ['E', 'A']
             
         elif self.mode == 'TEMP_OP':
-            # Su Kripke a 1 agente, 'A F' è sempre falsificata dal ramo passivo DEFEND dell'NPC
             if self.quantifier == 'A':
                 allowed = ['G']
             else:
@@ -55,30 +61,25 @@ class GrammarMasker:
             
         elif self.mode == 'FORMULA':
             if self.last_token in ['F', 'G', 'and', 'or']:
-                allowed = [p for p in self.vocab.propositions if p not in self.used_props]
+                available = [p for p in self.vocab.propositions if p not in self.used_props]
                 
                 if self.temp_op == 'G':
-                    # Solo Alive_N è garantita vera in s0 anche a parità o svantaggio di HP
-                    allowed = [p for p in allowed if p == 'Alive_N']
+                    allowed = [p for p in available if p in self.invariants]
                 elif self.temp_op == 'F' and self.bool_count == 0:
-                    allowed = [p for p in allowed if p != 'Alive_N']
-                
-                if self.last_bool_op == 'or' and 'Horizon' in allowed:
-                    allowed.remove('Horizon')
-                if self.last_bool_op == 'or' and 'Alive_N' in allowed:
-                    allowed.remove('Alive_N')
+                    allowed = [p for p in available if p in self.primary_goals]
+                elif self.last_token == 'and':
+                    allowed = [p for p in available]
+                elif self.last_token == 'or':
+                    allowed = [p for p in available if p in self.primary_goals]
 
             elif self.last_token in self.vocab.propositions:
                 if self.temp_op == 'G':
                     allowed = ['<EOS>']
-                elif self.last_token == 'Horizon' and self.bool_count < 1:
-                    allowed = ['and']
+                elif self.last_token in self.force_and:
+                    allowed = ['and'] if self.bool_count < 1 else ['<EOS>']
                 else:
                     if self.bool_count < 1:
-                        if 'Alive_N' in self.used_props:
-                            allowed = ['and', '<EOS>']
-                        else:
-                            allowed = ['and', 'or', '<EOS>']
+                        allowed = ['and', 'or', '<EOS>']
                     else:
                         allowed = ['<EOS>']
                         

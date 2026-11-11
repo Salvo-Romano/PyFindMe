@@ -115,8 +115,8 @@ class LogicFightersState:
 
 
     def _reduce_counter_cooldown(self, fighter, action):
-        if action == Action.COUNTER:
-            fighter.counter_cooldown = max(0, fighter.counter_cooldown - 1)
+        if fighter.counter_cooldown > 0:
+            fighter.counter_cooldown -= 1
 
     def is_finished(self):
         return self.player.hp <= 0 or self.npc.hp <= 0

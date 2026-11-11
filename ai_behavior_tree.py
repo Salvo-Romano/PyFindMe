@@ -198,45 +198,6 @@ def build_ranger_tree():
         ]),
         ActionLeaf(Action.ATTACK)
     ])
-
-
-class BehaviorTreeAI:
-    def __init__(self):
-        self.trees = {
-            "Warrior": build_warrior_tree(),
-            "Mage": build_mage_tree(),
-            "Ranger": build_ranger_tree()
-        }
-
-    def decide_action(self, state, npc_role="npc"):
-        char = state.npc if npc_role == "npc" else state.player
-        char_class = getattr(char, "char_class", None) or getattr(state, f"selected_{npc_role}_class", "Warrior")
-        tree = self.trees.get(char_class, self.trees["Warrior"])
-        
-        # 1. Chiedi all'albero la mossa tattica ideale
-        _, bt_action = tree.tick(state, npc_role)
-        chosen_action = bt_action if bt_action else Action.ATTACK
-
-        # 2. Imprevedibilità (25% di probabilità)
-        if random.random() < 0.25:
-            valid_actions = [Action.ATTACK, Action.DEFEND, Action.BUFF]
-            
-            # Aggiungi SPECIAL solo se pronta
-            if char.sp >= char.stats["sp_threshold"]:
-                valid_actions.append(Action.SPECIAL)
-                
-            # Aggiungi COUNTER solo se il cooldown è a 0
-            if getattr(char, "counter_cooldown", 0) == 0:
-                valid_actions.append(Action.COUNTER)
-            
-            # Rimuovi la mossa originale per forzare una variazione reale
-            if chosen_action in valid_actions and len(valid_actions) > 1:
-                valid_actions.remove(chosen_action)
-                
-            # Pesca a caso tra le opzioni rimaste
-            chosen_action = random.choice(valid_actions)
-
-        return chosen_action
     
 class BehaviorTreeAI:
     def __init__(self):
